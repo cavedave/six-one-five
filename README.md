@@ -44,7 +44,7 @@ Non-primitive solutions are d⁶-scalings of smaller primitive ones, so:
 
 > **It suffices to test B with gcd(B, 42) = 1.** This discards 5/7 of all B
 > values *by proof*, before any GPU time is spent. Coverage of the remaining
-> 2/7 is complete, not heuristic.
+> 2/7 is complete, not heuristic search.
 
 (The same counting, run forwards with gcd(B,42)=1, forces **exactly one** aᵢ
 to be odd, exactly one to be coprime to 3, and exactly one to be coprime to 7
@@ -85,8 +85,8 @@ load factor 0.32; average insert probe length 1.23). For B_max = 2.2M that is
 GPU in ~2 s. Duplicate fingerprints occupy multiple slots; `payload == 0`
 marks empties.
 
-The 64-bit value is a **fingerprint**, not a proof — collisions are expected
-(2,264 occurred) and every hit is re-verified exactly (trick 6).
+The 64-bit value is a **fingerprint**, a bloom like filter not a proof — collisions are expected
+(2,264 occurred) and every hit is re-verified exactly (trick 6). A ribbon data structure would be about a tenth the size but not implemented yet.
 
 ### 5. GPU probe engine at 1.4 × 10¹⁰ lookups/s
 
@@ -110,7 +110,7 @@ Sanity cross-check: observed false-hit rate ≈ 4.9 × 10⁻¹¹/probe matches t
 theoretical table density (1.37 × 10⁹ fingerprints in 2⁶⁴ ≈ 7.4 × 10⁻¹¹)
 to order of magnitude — the lookup layer behaves as modeled.
 
-### 7. A validation chain, not a vibe
+### 7. A validation chain, but there is more to check
 
 * `--selftest`: host number theory (sixth roots, modular inverses via extended
   Euclid) + 20,000 planted pair sums + 3 × 512 planted class solutions driven
@@ -125,7 +125,7 @@ to order of magnitude — the lookup layer behaves as modeled.
 
 ## Engineering notes
 
-* **Toolkit gap:** the card is sm_120 (Blackwell) but CUDA 12.4 predates sm_120
+* **Toolkit gap:** the card used is sm_120 (Blackwell) but CUDA 12.4 predates sm_120
   support, so the binary targets `compute_90` PTX and the driver JIT-compiles
   it on first launch (small one-time pause; slightly pessimistic codegen).
   With CUDA ≥ 12.8, build natively for sm_120 instead.

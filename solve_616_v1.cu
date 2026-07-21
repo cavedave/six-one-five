@@ -1,66 +1,95 @@
 // =============================================================================
-// solve_516_v3.cu — GPU-accelerated five-class (6,1,5) solver
-//     a1^6 + a2^6 + a3^6 + a4^6 + a5^6 = B^6,  1<=a1<...<a5<B, gcd=1
+// solve_616_v1.cu — GPU-accelerated five-class (6,1,6) solver
+//     a1^6 + a2^6 + a3^6 + a4^6 + a5^6 + a6^6 = B^6,  1<=a1<...<a6<B, gcd=1
 // =============================================================================
 //
-// GPU successor to solve_516_v2.cpp. THE MATHEMATICS IS IDENTICAL TO v2: same
-// five Meyrignac classes, same master congruences, same seed/unit machinery,
-// same completeness guarantees. The GPU only accelerates the decomposition
-// stage (find4/find3/find2 over the meet-in-the-middle pair table).
+// Sibling of solve_516_v3.cu (same table, same kernels, same validation
+// philosophy). THE CLASS SYSTEM IS NEW but built from the same parts.
 //
-// DESIGN (see 615-gpu-runbook.md):
-//   * Pair table = cuckoo-style open-addressing hash in VRAM. Slot = 16 bytes:
-//       key     = (c_i^6 + c_j^6) mod 2^64   ("fingerprint", fp64)
-//       payload = (i<<16) | j                (i <= j; requires N <= 65535,
-//                                             i.e. B <= 2.75M — covers the
-//                                             whole i128 regime, B <= 2.2M)
-//     Probing: double hashing, pos = h1(fp), step = mix64(fp)|1, scan until an
-//     empty slot (payload==0). Duplicate fingerprints occupy multiple slots and
-//     are ALL reported (scan continues past matches until the first empty).
-//   * WHY NO 128-BIT MATH ON THE GPU: a query target is only ever needed
-//     mod 2^64. For class 1 the CPU passes Q=(B^6-u^6)/42^6 precomputed
-//     (one i128 division per candidate). For classes 2-5 the target is
-//     T = R/42^6 with R = B^6-u^6-(free terms)^6; since R is always divisible
-//     by 64 (valuation laws) and 42^6 = 64 * 21^6 with 21^6 odd,
-//         T mod 2^64 = ((R>>6) mod 2^64) * (21^6)^{-1}  (mod 2^64).
-//     So the kernel does: 128-bit subtract (2 instr), funnel shift, one 64-bit
-//     multiply. No 128-bit division anywhere. (Identity verified in selftest.)
-//   * CORRECTNESS: completeness — every pair (i,j), i<=j<=N, is in the table,
-//     and any true pair has matching fp64, so every decomposition v2 would
-//     find is reported. Soundness — every fingerprint hit is re-verified on
-//     the CPU with exact i128 arithmetic (plus the mod-300 filter); false
-//     positives (fp64 collisions) are expected ~1e-5 per campaign.
-//   * WINDOW MATH ON GPU: sixth-root bounds are computed with a double-power
-//     approximation then EXACT fix-up loops using 128-bit integer compares
-//     (saturating multiplies), so no floating-point error can affect results.
-//   * PROBE GATE (mod 124,488 = 8*9*7*13*19): before each table lookup, test
-//     whether the target residue is achievable as a pair sum i^6+j^6 mod 504 and
-//     mod 247 (CRT-factored bitmaps in shared memory). Only ~1.08% pass — ~98.9%
-//     of probes die for ~20 ALU cycles. Sound by construction; --no-gate disables
-//     it for A/B bench. (Design: 615-ribbon-filter-plan.md discusses a separate
-//     table-compression variant; the gate is orthogonal.)
+// MATHEMATICAL STRUCTURE (completeness argument):
+//   For a primitive solution, B must be coprime to 42 (mod-8/9/7 counting:
+//   B even => all a_i even; 3|B => all a_i/3; 7|B => all a_i/7 — non-primitive,
+//   a d^6-scaling of a smaller primitive one). With gcd(B,42)=1, sixth powers
+//   are 0/1 mod 8,9,7, so among the six terms there is EXACTLY ONE odd term,
+//   EXACTLY ONE term not divisible by 3 ("~3"), and EXACTLY ONE term not
+//   divisible by 7 ("~7"). The three "roles" {odd, ~3, ~7} are distributed
+//   over the six terms in one of the FIVE set-partitions, and every term not
+//   carrying a role is divisible by 42. Distinguishing the role-carrying
+//   terms as the "free" terms u, v(, w) and writing the divisible terms as
+//   42*c (seeds c <= B/42) gives five classes:
 //
-// WORK DISTRIBUTION (per eligible B at B=2.2M; see 615-search-code-reading-notes):
-//   cls5 ~80% of probes (2-D (e,d) grid — the best GPU kernel), cls4 ~7%,
-//   cls2 ~4%, cls3 ~2%, cls1 ~0.3%. Campaign 730k..2.2M ~ 1.6e14 probes
-//   ~ a day at 2-4e9 probes/s (vs ~1.5-3 months on 4 CPU cores).
+//   cls1  {o37}        u: gcd(u,42)=1, u^6≡B^6 (42^6) [144 classes];
+//                      sixth term = 42w (w = any seed); 4 seeds -> find4.
+//                      Q = (B^6-u^6)/42^6 - w^6 = c1^6+c2^6+c3^6+c4^6
+//   cls2  {o7}|{3}     u: odd, 3|u, u^6≡B^6 (14^6) [24 classes];
+//                      v = 14v', (14v')^6≡B^6 (3^6) [6 classes]; 4 seeds.
+//                      Q = (B^6-u^6-(14v')^6)/42^6
+//   cls3  {37}|{o}     u: even, gcd(u,21)=1, u^6≡B^6 (21^6) [36 classes];
+//                      v = 21v', (21v')^6≡B^6-u^6 (2^6) [4 classes]; 4 seeds.
+//                      Q = (B^6-u^6-(21v')^6)/42^6
+//   cls4  {o3}|{7}     u: odd, ~3, 7|u, u^6≡B^6 (2^6*3^6) [24 classes];
+//                      v = 6v', (6v')^6≡B^6 (7^6) [6 classes]; 4 seeds.
+//                      Q = (B^6-u^6-(6v')^6)/42^6
+//   cls5  {o}|{3}|{7}  u = 14u', (14u')^6≡B^6 (3^6)  [~3 term];
+//                      v = 6v',  (6v')^6≡B^6 (7^6)  [~7 term];
+//                      kernel grid w = 21w', (21w')^6≡B^6 (2^6) [odd term];
+//                      3 seeds -> find3:  T = (B^6-(14u')^6-(6v')^6-(21w')^6)/42^6
+//                      = c1^6+c2^6+c3^6   (k_cls234, factor 21)
 //
-// Build (on the server, CUDA >= 12.8 for Blackwell sm_120):
-//   nvcc -O3 -std=c++20 -arch=native -Xcompiler -fopenmp \
-//        -o solve_516_v3 solve_516_v3.cu
+//   The partitions are disjoint by role-placement, so every primitive
+//   solution lies in EXACTLY ONE class (up to interchangeable 42-divisible
+//   terms, deduplicated at verification). Classes are COMPLETE by the same
+//   mod-8/9/7 counting as v2/v3 (Gerbicz-Meyrignac-Beckert arXiv:1108.0462).
+//
+// KERNEL REUSE: cls1-4 run k_cls1 verbatim (host precomputes the find4
+// target Q and the c4 window). cls5 runs k_cls234 verbatim (factor=21; the
+// grid term is the odd role-carrier 21w'). 515's cls4/cls5 kernels are gone.
+//
+// PROBE GATE (mod 124,488 = 8*9*7*13*19): a pair sum i^6+j^6 lands in only
+//   3/8, 3/9, 3/7 of residues mod 8,9,7 (sixth powers are {0,1}) and only
+//   5/13, 10/19 mod 13,19 (sixth powers are {0,±1} mod 13, {0,1,7,11} mod 19).
+//   By CRT a target is achievable mod 124,488 in just 27*50/124,488 = 1.08%
+//   of residues. The kernels carry two tiny SHARED bitmaps (504-bit + 247-bit
+//   — the CRT-factored form of the 124,488-entry bitmap, same predicate) and
+//   test (T - c3^6) before every table probe: 98.9% of probes die for ~20 ALU
+//   cycles and never touch the table. c3's residues advance incrementally
+//   (stride add + conditional subtract), so the hot loop has NO divisions.
+//   Sound by construction (every real pair sum passes); the plant tests and
+//   xcheck would fail loudly otherwise. --no-gate disables it (A/B bench).
+//   (Design: 615-ribbon-filter-plan.md; projected ~90x probe-stage speedup.)
+//
+// GpuCand fields (per class):
+//   cls1: q=Q (find4 target, = Q0 - w^6), c4lo/hi; u=role term, w=42*w (6th term)
+//   cls2: q=Q, c4lo/hi; u=role term, w=14*v'
+//   cls3: q=Q, c4lo/hi; u=role term, w=21*v'
+//   cls4: q=Q, c4lo/hi; u=role term, w=6*v'
+//   cls5: q=base=B^6-(14u')^6-(6v')^6; res/mod1/fmax1 = w'-grid (mod 64);
+//         u=14*u' (~3 term), w=6*v' (~7 term); factor=21
+//
+// COST MODEL (per-B, B in units of 1e6; find4 ~3.2e7 probes/cand, find3
+//   window ~7.4e3 probes per grid value — windows scale B^2, cand counts ~B^2,
+//   so every class scales B^4):
+//     cls1 ~1.3e10  cls2 ~6e10  cls3 ~4e10  cls4 ~2e10  cls5 ~1.1e11 probes/B
+//   cls5 dominates (u' x v' anchors ~ B^2/2e8, each with grid ~B/336 x window).
+//   TOTAL ~2.3e11 probes/B at 1M (B^4): at the 615-measured ~1.4e10 probes/s
+//     [110267, 400k] ~ 2.5-3 h, [110267, 500k] ~ 8 h on the RTX PRO 6000.
+// KNOWN BOUND: EulerNet (euler.free.fr/progress.htm) covered (6,1,6) to
+//   B = 110,266 by Jan 2000 — new ground starts at 110,267. xcheck overlap
+//   target: [100000, 130000] (inside their range: any "solution" there is a bug).
+//
+// Build (server, CUDA 12.4 stopgap for sm_120):
+//   nvcc -O3 -std=c++17 -gencode arch=compute_90,code=compute_90 -o solve_616_v1 solve_616_v1.cu -lineinfo
+// Host-only logic check (no GPU needed):
+//   g++ -O2 -std=c++17 -DHOST_ONLY -fopenmp -o solve_616_host solve_616_v1.cu && ./solve_616_host
 // Run:
-//   ./solve_516_v3 --selftest                 # host math + GPU plant tests
-//   ./solve_516_v3 730000 2200000 all --save-table table_2p2M.bin
-//   ./solve_516_v3 730001 750000 all --load-table table_2p2M.bin
-//   ./solve_516_v3 300000 400000 all --xcheck # CPU-vs-GPU cross-validation
-// Options: --chunk K (B per batch, default 8192), --device K, --hit-cap N,
-//          --slots-log2 S, --bench K, --quiet, --no-gate. u band: [u_lo] [u_hi].
-//
-// References: LPS 1967; Resta-Meyrignac 2003; Gerbicz-Meyrignac-Beckert
-// arXiv:1108.0462; Bernstein Math. Comp. 70 (2001); euler.free.fr database.
+//   ./solve_616_v1 --selftest
+//   ./solve_616_v1 100000 130000 all --xcheck
+//   ./solve_616_v1 110267 400000 all
 // =============================================================================
 
+#ifndef HOST_ONLY
 #include <cuda_runtime.h>
+#endif
 
 #include <algorithm>
 #include <array>
@@ -81,10 +110,6 @@
 #include <omp.h>
 #endif
 
-#if __has_include("mod60.hpp")
-#include "mod60.hpp"
-#define HAVE_MOD60 1
-#endif
 #if __has_include("quad_sum.hpp")
 #include "quad_sum.hpp"
 #define HAVE_XCHECK 1
@@ -97,6 +122,12 @@ using i128 = __int128_t;
 using u128 = __uint128_t;
 using Clock = std::chrono::steady_clock;
 
+#ifdef HOST_ONLY
+#define HD inline
+#else
+#define HD __host__ __device__ __forceinline__
+#endif
+
 // ---------------------------------------------------------------- constants --
 static constexpr long long M2 = 64LL;         // 2^6
 static constexpr long long M3 = 729LL;        // 3^6
@@ -105,12 +136,14 @@ static constexpr long long M14 = 7529536LL;   // 14^6
 static constexpr long long M21 = 85766121LL;  // 21^6  (odd part of 42^6)
 static constexpr long long M42 = 5489031744LL;// 42^6 = 64 * 21^6
 static constexpr int K = 6;
-static constexpr long long B_HARD_MAX = 2200000;   // B^6 < 2^127 (i128 guard)
+static constexpr long long B_HARD_MAX = 2353973;   // B^6 < 2^127 (i128 guard)
 static constexpr u64 PHI64 = 0x9E3779B97F4A7C15ULL; // fibonacci hash constant
 
+#ifndef HOST_ONLY
 #define CU(x) do { cudaError_t e_ = (x); if (e_ != cudaSuccess) { \
     fprintf(stderr, "CUDA error '%s' at %s:%d\n", cudaGetErrorString(e_), __FILE__, __LINE__); \
     exit(1); } } while (0)
+#endif
 
 // ------------------------------------------------- host small modular tools --
 static long long mod_pow6(long long base, long long mod) {
@@ -144,7 +177,7 @@ static long long crt2(long long r1, long long m1, long long r2, long long m2) {
     return ans;
 }
 
-// i128 sixth power (host; B <= 2.2M so x^6 < 2^127 always).
+// i128 sixth power (host; B <= 2.35M so x^6 < 2^127 always).
 static i128 ipow6(long long x) {
     i128 r = 1, b = x;
     for (int e = 0; e < 6; ++e) r *= b;
@@ -163,9 +196,9 @@ static long long iroot6_i128(i128 n) {
 }
 
 // ------------------------------------------------------------- root tables --
-// Identical to v2: for every sixth-power residue r among UNITS mod m, the
-// units a with a^6 ≡ r. mod 2^6: 8 residues x 4 roots; mod 3^6: 81 x 6;
-// mod 7^6: 16807 x 6 (Teichmuller).
+// Same as v2/v3: for every sixth-power residue r among UNITS mod m, the units
+// a with a^6 ≡ r. mod 2^6: 8 residues x 4 roots; mod 3^6: 81 x 6; mod 7^6:
+// 16807 x 6 (Teichmuller).
 struct RootTables {
     std::vector<std::vector<long long>> r2, r3, r7;
     RootTables() : r2(M2), r3(M3), r7(M7) {
@@ -174,6 +207,13 @@ struct RootTables {
         for (long long a = 1; a < M7; ++a) if (std::gcd(a, M7) == 1) r7[mod_pow6(a, M7)].push_back(a);
     }
 };
+
+// roots of (scale*x)^6 ≡ B^6 (mod m): x^6 ≡ B^6 * (scale^6)^{-1}.
+static std::vector<long long> scaled_roots(const std::vector<std::vector<long long>>& tab,
+                                           long long b6, long long scale, long long mod) {
+    const long long t = b6 * mod_inv(mod_pow6(scale, mod), mod) % mod;
+    return tab[t];
+}
 
 static std::vector<long long> seeds_for_B(const RootTables& rt, long long B, int cls) {
     const long long b2 = mod_pow6(B, M2), b3 = mod_pow6(B, M3), b7 = mod_pow6(B, M7);
@@ -187,99 +227,79 @@ static std::vector<long long> seeds_for_B(const RootTables& rt, long long B, int
     } else if (cls == 2) {   // 24 classes mod 14^6
         for (long long s2 : rt.r2[b2])
             for (long long s7 : rt.r7[b7]) out.push_back(crt2(s2, M2, s7, M7));
-    } else if (cls == 3) {   // 36 classes mod 21^6
+    } else {                 // cls 3: 36 classes mod 21^6
         for (long long s3 : rt.r3[b3])
             for (long long s7 : rt.r7[b7]) out.push_back(crt2(s3, M3, s7, M7));
-    } else {                 // classes 4,5: 6 classes mod 7^6
-        out = rt.r7[b7];
-    }
-    std::sort(out.begin(), out.end());
-    out.erase(std::unique(out.begin(), out.end()), out.end());
-    return out;
-}
-static long long class_modulus(int cls) {
-    switch (cls) {
-        case 1: return M42; case 2: return M14; case 3: return M21; default: return M7;
-    }
-}
-static bool unit_ok(long long u, int cls) {
-    switch (cls) {
-        case 1: return (u & 1) && std::gcd(u, 42LL) == 1;
-        case 2: return (u & 1) && (u % 3 == 0) && (u % 9 != 0);
-        case 3: return !(u & 1) && std::gcd(u, 21LL) == 1;
-        case 4:
-        case 5: return (u % 6 == 0) && (u % 7 != 0);
-    }
-    return false;
-}
-static std::vector<long long> unit_candidates(const RootTables& rt, long long B, int cls,
-                                              double lo_frac, double hi_frac) {
-    const long long M = class_modulus(cls);
-    const long long lo = std::max(1LL, (long long)(lo_frac * B));
-    const long long hi = std::min(B - 1, (long long)(hi_frac * B));
-    std::vector<long long> out;
-    for (long long s : seeds_for_B(rt, B, cls)) {
-        long long u = s % M;
-        if (u < lo) u += (lo - u + M - 1) / M * M;
-        for (; u <= hi; u += M)
-            if (unit_ok(u, cls)) out.push_back(u);
     }
     std::sort(out.begin(), out.end());
     out.erase(std::unique(out.begin(), out.end()), out.end());
     return out;
 }
 
-// ------------------------------------------- free-term residue class sets --
-// Same valuation filters as v2.
+// (14d)^6 ≡ B^6 (3^6): 6 classes mod 729. (cls2 v', cls5 u')
 static std::vector<long long> classes_d_cls2(const RootTables& rt, long long B) {
     const long long t = mod_pow6(B, M3) * mod_inv(mod_pow6(14, M3), M3) % M3;
-    return rt.r3[t];                                    // 6 classes mod 729
+    return rt.r3[t];
 }
+// (21d)^6 ≡ B^6-u^6 (2^6): 4 classes mod 64. (cls3 v')
 static std::vector<long long> classes_d_cls3(const RootTables& rt, long long B, long long u) {
     long long rhs = (mod_pow6(B, M2) - mod_pow6(u, M2)) % M2; if (rhs < 0) rhs += M2;
     const long long t = rhs * mod_inv(mod_pow6(21, M2), M2) % M2;
-    return rt.r2[t];                                    // 4 classes mod 64
+    return rt.r2[t];
 }
+// u^6 ≡ B^6 (2^6, 3^6): 24 classes mod 46656. (cls4 u)
 static std::vector<long long> classes_d_cls4(const RootTables& rt, long long B) {
     const long long t2 = mod_pow6(B, M2) * mod_inv(mod_pow6(7, M2), M2) % M2;
     const long long t3 = mod_pow6(B, M3) * mod_inv(mod_pow6(7, M3), M3) % M3;
     std::vector<long long> out;
     for (long long a : rt.r2[t2]) for (long long b : rt.r3[t3]) out.push_back(crt2(a, M2, b, M3));
     std::sort(out.begin(), out.end());
-    return out;                                         // 24 classes mod 46656
-}
-static std::vector<long long> classes_e_cls5(const RootTables& rt, long long B) {
-    return classes_d_cls2(rt, B);                       // (14e)^6 ≡ B^6 (3^6)
-}
-static std::vector<long long> classes_d_cls5(const RootTables& rt, long long B, long long u) {
-    return classes_d_cls3(rt, B, u);                    // (21d)^6 ≡ B^6-u^6 (2^6)
+    return out;
 }
 
-// -------------------------------------------------- 21^6 inverse mod 2^64 --
-// Newton iteration: x <- x(2 - a x) doubles correct bits; start x=a (mod 8).
-static u64 inv216_mod_2_64() {
-    u64 a = (u64)M21, x = a;
-    for (int i = 0; i < 6; ++i) x = x * (2 - a * x);   // wrapping u64 arithmetic
-    return x;
+// ------------------------------------------------- 616 class glue (host) --
+// primary free-term classes and modulus per class
+static std::vector<long long> seeds616(const RootTables& rt, long long B, int cls) {
+    switch (cls) {
+        case 1: return seeds_for_B(rt, B, 1);          // mod 42^6
+        case 2: return seeds_for_B(rt, B, 2);          // mod 14^6
+        case 3: return seeds_for_B(rt, B, 3);          // mod 21^6
+        case 4: return classes_d_cls4(rt, B);          // mod 2^6*3^6 = 46656
+        default: return classes_d_cls2(rt, B);         // cls5 u': (14u')^6≡B^6 (3^6)
+    }
+}
+static long long mod616(int cls) {
+    switch (cls) {
+        case 1: return M42; case 2: return M14; case 3: return M21;
+        case 4: return M2 * M3; default: return M3;
+    }
+}
+static bool unit_ok616(long long u, int cls) {
+    switch (cls) {
+        case 1: return (u & 1) && std::gcd(u, 42LL) == 1;   // auto from seeds (safety)
+        case 2: return (u & 1) && (u % 3 == 0);             // odd (auto); ÷3
+        case 3: return !(u & 1) && std::gcd(u, 21LL) == 1;  // even; ~3 ~7 (auto)
+        case 4: return (u % 7 == 0);                        // odd,~3 (auto); ÷7
+        default: return true;                               // cls5 u': ~3 auto
+    }
 }
 
 // =============================================================================
-// PAIR TABLE (host build, device query)
+// PAIR TABLE (host build, device query) — identical to v3.
 // Slot: 16 bytes. payload==0 marks empty. payload=(i<<16)|j, i<=j, N<=65535.
 // =============================================================================
 struct Slot { u64 key; u32 payload; u32 pad; };
 
-__host__ __device__ __forceinline__ u64 mix64(u64 x) {
+HD u64 mix64(u64 x) {
     x ^= x >> 33; x *= 0xff51afd7ed558ccdULL;
     x ^= x >> 33; x *= 0xc4ceb9fe1a85ec53ULL;
     x ^= x >> 33; return x;
 }
-__host__ __device__ __forceinline__ u64 hash_pos(u64 fp, int S) {
+HD u64 hash_pos(u64 fp, int S) {
     return (fp * PHI64) >> (64 - S);
 }
 
 // Build slots for all pairs 1<=i<=j<=N, fp = (i^6+j^6) mod 2^64.
-// Duplicated fingerprints are stored in multiple slots (query scans to empty).
 static void table_build(int N, int S, std::vector<Slot>& slots) {
     const size_t size = (size_t)1 << S;
     const double pairs_est = (double)N * (N + 1) / 2;
@@ -309,8 +329,8 @@ static void table_build(int N, int S, std::vector<Slot>& slots) {
             for (;;) {
                 ++local;
                 if (__sync_bool_compare_and_swap(&slots[pos].payload, 0u, pld)) {
-                    slots[pos].key = fp;   // after claim; only concurrent inserters
-                    break;                 // can mis-read, causing a benign extra dup
+                    slots[pos].key = fp;
+                    break;
                 }
                 pos = (pos + step) & mask;
             }
@@ -327,7 +347,7 @@ struct TableHeader { char magic[8]; u64 N, S; };
 static void table_save(const char* path, const std::vector<Slot>& slots, int N, int S) {
     FILE* f = fopen(path, "wb");
     if (!f) { fprintf(stderr, "[table] cannot open %s for write\n", path); return; }
-    TableHeader h; memcpy(h.magic, "516TBL01", 8); h.N = (u64)N; h.S = (u64)S;
+    TableHeader h; memcpy(h.magic, "616TBL01", 8); h.N = (u64)N; h.S = (u64)S;
     fwrite(&h, sizeof(h), 1, f);
     fwrite(slots.data(), sizeof(Slot), slots.size(), f);
     fclose(f);
@@ -337,18 +357,17 @@ static bool table_load(const char* path, std::vector<Slot>& slots, int N, int& S
     FILE* f = fopen(path, "rb");
     if (!f) return false;
     TableHeader h;
-    if (fread(&h, sizeof(h), 1, f) != 1 || memcmp(h.magic, "516TBL01", 8) != 0) {
+    if (fread(&h, sizeof(h), 1, f) != 1 || memcmp(h.magic, "616TBL01", 8) != 0) {
         fclose(f); fprintf(stderr, "[table] bad file %s\n", path); return false;
     }
     if ((int)h.N != N) {
-        fclose(f);
-        fprintf(stderr, "[table] N mismatch: file N=%llu, need %d — rebuilding\n", (unsigned long long)h.N, N);
+        fclose(f); fprintf(stderr, "[table] N mismatch: file N=%llu, need %d — rebuilding\n", (unsigned long long)h.N, N);
         return false;
     }
     S = (int)h.S;
     slots.assign((size_t)1 << S, Slot{0, 0, 0});
     const size_t want = slots.size() * sizeof(Slot);
-    const size_t got = fread(slots.data(), 1, want, f);
+    const size_t got = fread(slots.data(), sizeof(Slot), want, f);
     fclose(f);
     if (got != want) { fprintf(stderr, "[table] short read %s\n", path); return false; }
     fprintf(stderr, "[table] loaded %s (N=%d, 2^%d slots)\n", path, N, S);
@@ -381,22 +400,24 @@ static void build_gate(GateData& g) {
 // DEVICE SIDE
 // =============================================================================
 // Candidate batch record. q_lo/q_hi carry:
-//   cls1: Q = (B^6-u^6)/42^6 (exact, CPU-divided)         — c4lo/c4hi set
-//   cls2-5: base = B^6-u^6 (128-bit)                      — free-term fields set
-// res[]: free-term residue classes; cls5: e-classes at [0..nres1), d-classes at
-// [nres1..nres1+nres2). cls2/3/4: d-classes at [0..nres1).
+//   cls1-4: Q (find4 target, exact, CPU-divided)           — c4lo/c4hi set
+//   cls5:   base = B^6-(14u')^6-(6v')^6 (128-bit)          — w'-grid fields set
+// w: second free term's ACTUAL value (host-side only; kernels ignore it):
+//   cls1: 42*wseed, cls2: 14*v', cls3: 21*v', cls4: 6*v', cls5: 6*v'
 struct GpuCand {
     u64 q_lo, q_hi;        // 16
     u32 B, u, lim;         // 12
-    u32 c4lo, c4hi;        // 8   (cls1 only)
-    u32 fmax1, fmax2;      // 8
-    u32 mod1, mod2;        // 8
-    u32 cls, nres1, nres2; // 12
-    u32 q504, q247;        // 8   (cls1 only: Q mod 504 / mod 247, for the gate)
+    u32 c4lo, c4hi;        // 8   (cls1-4 only)
+    u32 fmax1, fmax2;      // 8   (fmax2 unused in 616)
+    u32 mod1, mod2;        // 8   (mod2 unused in 616)
+    u32 cls, nres1, nres2, w; // 16 (w replaces v3's pad)
+    u32 q504, q247;        // 8   (cls1-4: Q mod 504 / mod 247, for the gate)
     u32 res[24];           // 96
 };                         // ~172 bytes
 
-struct Hit { u32 cand, a, b, c, d; };  // a,b = pair indices; c,d = context (c3,c4 | c3,d | d,e)
+struct Hit { u32 cand, a, b, c, d; };  // a,b = pair indices; c,d = context (c3,c4 | c3,w')
+
+#ifndef HOST_ONLY
 
 struct Params {
     const Slot* __restrict__ tab;
@@ -410,7 +431,7 @@ struct Params {
     const GpuCand* __restrict__ cands;
     u32 n_cand;
     u64 inv216;              // (21^6)^{-1} mod 2^64
-    u32 factor;              // cls234 free-term factor: 14 / 21 / 7
+    u32 factor;              // cls5 grid-term factor: 21
     u32 use_gate;            // 0 disables the probe gate (--no-gate)
     const u64* __restrict__ g504;   // gate bitmaps (8 and 4 words)
     const u64* __restrict__ g247;
@@ -418,45 +439,39 @@ struct Params {
     const u16* __restrict__ p6247;
     u64* __restrict__ calls;        // probe() invocations
     u64* __restrict__ gated;        // probes killed by the gate
-    u64 c_m504;                // 2^64 mod (504*42^6)   (T-mod reduction)
+    u64 c_m504;                // 2^64 mod (504*42^6)   (cls5 T-mod reduction)
     u64 c_m247;                // 2^64 mod 247
     u64 inv42_247;             // (42^6)^{-1} mod 247
 };
 
 // ------------------------------------------- device 64/128-bit primitives --
-// x^6 mod 2^64 (x <= 65535 in all uses).
 __device__ __forceinline__ u64 pow6_64(u32 x) {
     const u64 x2 = (u64)x * x;
     return x2 * x2 * x2;
 }
-// x^6 as exact 128-bit (hi,lo). Valid for x < 2^21.33 (all our inputs < 2.3e6).
 __device__ __forceinline__ void pow6_128(u32 x, u64& hi, u64& lo) {
-    const u64 x2 = (u64)x * x;                 // < 2^43
-    const u64 h4 = __umul64hi(x2, x2), l4 = x2 * x2;   // x^4 < 2^86
+    const u64 x2 = (u64)x * x;
+    const u64 h4 = __umul64hi(x2, x2), l4 = x2 * x2;
     lo = l4 * x2;
-    hi = __umul64hi(l4, x2) + h4 * x2;         // x^6 < 2^127
+    hi = __umul64hi(l4, x2) + h4 * x2;
 }
-// (hi:lo) * m with saturation flag (m small). Returns true if product >= 2^128.
 __device__ __forceinline__ bool mul128_small(u64& hi, u64& lo, u64 m) {
     const u64 h1 = __umul64hi(lo, m);
-    const u64 h2 = hi * m;                     // wraps if overflowing
+    const u64 h2 = hi * m;
     bool of = (hi != 0) && (__umul64hi(hi, m) != 0);
     hi = h1 + h2;
     of |= (hi < h1);
     lo = lo * m;
     return of;
 }
-// greater-than compare of 128-bit values.
 __device__ __forceinline__ bool gt128(u64 ah, u64 al, u64 bh, u64 bl) {
     return (ah > bh) || (ah == bh && al > bl);
 }
-// Is SCALE * c^6 > R ? (saturating: overflow counts as "greater").
 __device__ __forceinline__ bool scaled_gt(u64 rh, u64 rl, u32 c, u64 scale) {
     u64 ch, cl; pow6_128(c, ch, cl);
     if (mul128_small(ch, cl, scale)) return true;
     return gt128(ch, cl, rh, rl);
 }
-// Largest r with scale*r^6 <= R. Double approx + exact fix-up.
 __device__ u32 iroot6_fix(u64 rh, u64 rl, double inv_scale, u64 scale) {
     const double d = (double)rh * 18446744073709551616.0 + (double)rl;
     u32 r = (u32)(pow(d * inv_scale, 1.0 / 6.0)) + 2;
@@ -464,18 +479,16 @@ __device__ u32 iroot6_fix(u64 rh, u64 rl, double inv_scale, u64 scale) {
     while (!scaled_gt(rh, rl, r + 1, scale)) ++r;
     return r;
 }
-// Is scale * c^6 < R ? (saturating: overflow counts as "not less").
 __device__ __forceinline__ bool scaled_lt(u64 rh, u64 rl, u32 c, u64 scale) {
     u64 ch, cl; pow6_128(c, ch, cl);
     if (mul128_small(ch, cl, scale)) return false;
     return gt128(rh, rl, ch, cl);
 }
-// Smallest c >= 1 with 3*scale*c^6 >= R, seeded near r_hi * 3^(-1/6).
 __device__ u32 min_c_fix(u64 rh, u64 rl, u32 r_hi, u64 scale) {
     u32 c = (u32)(r_hi * 0.8326831149);
     if (c < 1) c = 1;
-    while (scaled_lt(rh, rl, c, 3 * scale)) ++c;                 // first c with 3*scale*c^6 >= R
-    while (c > 1 && !scaled_lt(rh, rl, c - 1, 3 * scale)) --c;   // trim overshoot
+    while (scaled_lt(rh, rl, c, 3 * scale)) ++c;
+    while (c > 1 && !scaled_lt(rh, rl, c - 1, 3 * scale)) --c;
     return c;
 }
 // fp64 of target R/42^6 given R (128-bit, divisible by 64). = ((R>>6) mod 2^64) * 21^-6.
@@ -486,14 +499,15 @@ __device__ __forceinline__ u64 funnel_fp(u64 rh, u64 rl, u64 inv216) {
 // (hi:lo) mod m, with c = 2^64 mod m precomputed (host). Requires m < 2^42.
 __device__ u64 mod128_64(u64 hi, u64 lo, u64 m, u64 c) {
     const u64 r = hi % m;
-    const u64 ph = __umul64hi(r, c), pl = r * c;
-    u64 t = (ph * c) % m;
+    const u64 ph = __umul64hi(r, c), pl = r * c;   // r*c < 2^84
+    u64 t = (ph * c) % m;                          // ph < 2^22 -> ph*c < 2^64
     t += pl % m; if (t >= m) t -= m;
     t += lo % m; if (t >= m) t -= m;
     return t;
 }
 
 // ------------------------------------------------------------- probe gate --
+// Shared copy of the factored bitmaps + sixth-power tables (~1.6 KB/block).
 struct GateSh { u64 g504[8]; u64 g247[4]; u16 p6504[504]; u16 p6247[247]; };
 __device__ __forceinline__ void gate_load(GateSh& s, const Params& P) {
     for (int i = threadIdx.x; i < 8;   i += blockDim.x) s.g504[i]  = P.g504[i];
@@ -502,7 +516,9 @@ __device__ __forceinline__ void gate_load(GateSh& s, const Params& P) {
     for (int i = threadIdx.x; i < 247; i += blockDim.x) s.p6247[i] = P.p6247[i];
     __syncthreads();
 }
-// Is (T - c3^6) an achievable pair sum mod 124,488?
+// Is (T - c3^6) an achievable pair sum mod 124,488? c3 enters via its
+// residues r504/r247 (maintained incrementally by the caller: stride add +
+// conditional subtract — no divisions in the hot loop).
 __device__ __forceinline__ bool gate_pass(const GateSh& s, u32 t504, u32 t247,
                                           u32 r504, u32 r247) {
     u32 x = t504 + 504u - s.p6504[r504]; if (x >= 504u) x -= 504u;
@@ -510,15 +526,7 @@ __device__ __forceinline__ bool gate_pass(const GateSh& s, u32 t504, u32 t247,
     u32 y = t247 + 247u - s.p6247[r247]; if (y >= 247u) y -= 247u;
     return (s.g247[y >> 6] >> (y & 63)) & 1ULL;
 }
-// Is T itself an achievable pair sum mod 124,488? (cls5 find2)
-__device__ __forceinline__ bool gate_pass_target(const GateSh& s, u32 t504, u32 t247) {
-    if (!((s.g504[t504 >> 6] >> (t504 & 63)) & 1ULL)) return false;
-    return (s.g247[t247 >> 6] >> (t247 & 63)) & 1ULL;
-}
 
-// Probe the table for fp; on every key match push a hit (scan continues to the
-// first empty slot so duplicate fingerprints are all collected).
-// Returns number of slot reads (for the probe-rate counter).
 __device__ u64 probe(const Params& P, u64 fp, u32 ci, u32 v3, u32 v4) {
     u64 pos = hash_pos(fp, P.S);
     const u64 step = mix64(fp) | 1ULL;
@@ -538,7 +546,7 @@ __device__ u64 probe(const Params& P, u64 fp, u32 ci, u32 v3, u32 v4) {
 }
 
 // ------------------------------------------------------------- kernels --
-// Class 1: Q = c1^6+c2^6+c3^6+c4^6. block per (cand, c4-chunk of 8*256 c4),
+// find4 (616 cls1-4): Q = c1^6+c2^6+c3^6+c4^6. block per (cand, c4-chunk),
 // warp per c4, lanes over c3 window.
 __global__ void k_cls1(Params P) {
     const u32 ci = blockIdx.x;
@@ -552,7 +560,7 @@ __global__ void k_cls1(Params P) {
     for (u32 c4 = base; c4 <= C.c4hi; c4 += 8) {
         u64 c4h, c4l; pow6_128(c4, c4h, c4l);
         const u64 rlo = C.q_lo - c4l;
-        const u64 rhi = C.q_hi - c4h - (C.q_lo < c4l ? 1 : 0);   // Q' = Q - c4^6
+        const u64 rhi = C.q_hi - c4h - (C.q_lo < c4l ? 1 : 0);
         if ((rhi >> 63) || ((rhi | rlo) == 0)) continue;
         u32 hi3 = iroot6_fix(rhi, rlo, 1.0, 1);
         const u32 capm = C.lim < c4 ? C.lim : c4;
@@ -583,8 +591,8 @@ __global__ void k_cls1(Params P) {
     if (skip) atomicAdd(P.gated, skip);
 }
 
-// Classes 2/3/4: find3 target T = (base - (f*d)^6)/42^6, window over c3.
-// block per (cand, d-flat-index); thread 0 computes R and the c3 window.
+// find3 (616 cls5): T = (base - (21w')^6)/42^6, window over c3.
+// block per (cand, w'-flat-index); thread 0 computes R and the c3 window.
 __global__ void k_cls234(Params P) {
     const u32 ci = blockIdx.x;
     if (ci >= P.n_cand) return;
@@ -603,9 +611,9 @@ __global__ void k_cls234(Params P) {
     gate_load(s_gate, P);
     if (threadIdx.x == 0) {
         s_active = 0;
-        u64 fh, fl; pow6_128(P.factor * d, fh, fl);              // (f*d)^6
+        u64 fh, fl; pow6_128(P.factor * d, fh, fl);              // (21*w')^6
         const u64 rlo = C.q_lo - fl;
-        const u64 rhi = C.q_hi - fh - (C.q_lo < fl ? 1 : 0);     // R = base - (fd)^6
+        const u64 rhi = C.q_hi - fh - (C.q_lo < fl ? 1 : 0);     // R = base - (21w')^6
         if ((rhi >> 63) == 0 && ((rhi | rlo) != 0)) {
             u32 hi3 = iroot6_fix(rhi, rlo, 1.0 / (double)M42, (u64)M42);
             if (hi3 > C.lim) hi3 = C.lim;
@@ -614,6 +622,9 @@ __global__ void k_cls234(Params P) {
                 if (lo3 <= hi3) {
                     s_lo = lo3; s_hi = hi3;
                     s_tfp = funnel_fp(rhi, rlo, P.inv216);
+                    // gate residues of T = R/42^6 (R is divisible by 42^6):
+                    //   T mod 504 = ((R mod 504*42^6) / 42^6) mod 504
+                    //   T mod 247 = (R mod 247) * (42^6)^{-1} mod 247
                     const u64 r1 = mod128_64(rhi, rlo, 504ULL * (u64)M42, P.c_m504);
                     s_t504 = (u32)((r1 / (u64)M42) % 504ULL);
                     const u64 r2 = mod128_64(rhi, rlo, 247ULL, P.c_m247);
@@ -639,56 +650,6 @@ __global__ void k_cls234(Params P) {
             r504 += 256; if (r504 >= 504u) r504 -= 504u;
             r247 += 256; while (r247 >= 247u) r247 -= 247u;
         }
-    }
-    if (cnt) atomicAdd(P.probes, cnt);
-    if (ncall) atomicAdd(P.calls, ncall);
-    if (skip) atomicAdd(P.gated, skip);
-}
-
-// Class 5: find2 target T = (base - (14e)^6 - (21d)^6)/42^6.
-// block per (cand, e-flat-index); threads stride the d grid.
-__global__ void k_cls5(Params P) {
-    const u32 ci = blockIdx.x;
-    if (ci >= P.n_cand) return;
-    const GpuCand C = P.cands[ci];
-    const u32 kmax1 = C.fmax1 / C.mod1 + 1;
-    const u32 t1 = blockIdx.y;
-    if (t1 >= C.nres1 * kmax1) return;
-    const u32 e = C.res[t1 % C.nres1] + (t1 / C.nres1) * C.mod1;
-    if (e == 0 || e > C.fmax1) return;
-
-    __shared__ u64 s_Eh, s_El, s_bh, s_bl;
-    __shared__ u32 s_res2[24], s_n2, s_mod2, s_fmax2, s_total;
-    __shared__ GateSh s_gate;
-    gate_load(s_gate, P);
-    if (threadIdx.x == 0) {
-        pow6_128(14 * e, s_Eh, s_El);
-        s_bh = C.q_hi; s_bl = C.q_lo;
-        s_n2 = C.nres2; s_mod2 = C.mod2; s_fmax2 = C.fmax2;
-        const u32 k2 = C.fmax2 / C.mod2 + 1;
-        s_total = C.nres2 * k2;
-        for (u32 i = 0; i < C.nres2 && i < 24; ++i) s_res2[i] = C.res[C.nres1 + i];
-    }
-    __syncthreads();
-    u64 cnt = 0, ncall = 0, skip = 0;
-    for (u32 t2 = threadIdx.x; t2 < s_total; t2 += blockDim.x) {
-        const u32 d = s_res2[t2 % s_n2] + (t2 / s_n2) * s_mod2;
-        if (d == 0 || d > s_fmax2) continue;
-        u64 dh, dl; pow6_128(21 * d, dh, dl);
-        u64 rlo = s_bl - s_El;
-        u64 rhi = s_bh - s_Eh - (s_bl < s_El ? 1 : 0);            // base - (14e)^6
-        const u64 rlo2 = rlo - dl;
-        const u64 rhi2 = rhi - dh - (rlo < dl ? 1 : 0);           // R
-        if ((rhi2 >> 63) || ((rhi2 | rlo2) == 0)) continue;
-        if (P.use_gate) {
-            const u64 r1 = mod128_64(rhi2, rlo2, 504ULL * (u64)M42, P.c_m504);
-            const u32 t504 = (u32)((r1 / (u64)M42) % 504ULL);
-            const u64 r2 = mod128_64(rhi2, rlo2, 247ULL, P.c_m247);
-            const u32 t247 = (u32)(r2 * P.inv42_247 % 247ULL);
-            if (!gate_pass_target(s_gate, t504, t247)) { ++skip; continue; }
-        }
-        ++ncall;
-        cnt += probe(P, funnel_fp(rhi2, rlo2, P.inv216), ci, d, e);
     }
     if (cnt) atomicAdd(P.probes, cnt);
     if (ncall) atomicAdd(P.calls, ncall);
@@ -728,6 +689,7 @@ struct GpuCtx {
     u64* d_probes = nullptr;
     GpuCand* d_cands = nullptr;
     size_t cand_cap = 0;
+    // probe gate
     u64* d_g504 = nullptr;
     u64* d_g247 = nullptr;
     u16* d_p6504 = nullptr;
@@ -788,48 +750,128 @@ static void gpu_upload_gate(GpuCtx& g, const GateData& gd) {
             100.0 * 27.0 * 50.0 / 124488.0);
 }
 
+#endif // HOST_ONLY
+
 // ----------------------------------------------------- candidate generation --
+// (host; used by campaign, xcheck, and the HOST_ONLY selftest)
 static void gen_class_cands(const RootTables& rt, long long B, int cls, double u_lo, double u_hi,
                             std::vector<GpuCand>& out) {
-    const auto units = unit_candidates(rt, B, cls, u_lo, u_hi);
+    const long long lo = std::max(1LL, (long long)(u_lo * B));
+    const long long hi = std::min(B - 1, (long long)(u_hi * B));
     const i128 B6 = ipow6(B);
-    for (long long u : units) {
-        GpuCand C{};
-        C.B = (u32)B; C.u = (u32)u; C.cls = (u32)cls; C.lim = (u32)((B - 1) / 42);
-        const i128 base = B6 - ipow6(u);
-        if (base <= 0) continue;
-        if (cls == 1) {
-            if (base % M42 != 0) continue;                    // guaranteed by seeds
-            const i128 Q = base / M42;
-            C.q_lo = (u64)Q; C.q_hi = (u64)((u128)Q >> 64);
-            const long long hi4 = std::min(iroot6_i128(Q), (long long)C.lim);
-            long long lo4 = (long long)(hi4 * 0.7937005260);  // 4^(-1/6)
-            if (lo4 < 1) lo4 = 1;
-            while (4 * ipow6(lo4) < Q) ++lo4;
-            while (lo4 > 1 && 4 * ipow6(lo4 - 1) >= Q) --lo4;
-            if (lo4 > hi4) continue;
-            C.c4lo = (u32)lo4; C.c4hi = (u32)hi4;
-            C.q504 = (u32)(long long)(Q % 504); C.q247 = (u32)(long long)(Q % 247);
-        } else {
-            C.q_lo = (u64)base; C.q_hi = (u64)((u128)base >> 64);
-            std::vector<long long> r1, r2;
-            switch (cls) {
-                case 2: r1 = classes_d_cls2(rt, B);    C.mod1 = M3; C.fmax1 = (u32)((B - 1) / 14); break;
-                case 3: r1 = classes_d_cls3(rt, B, u); C.mod1 = M2; C.fmax1 = (u32)((B - 1) / 21); break;
-                case 4: r1 = classes_d_cls4(rt, B);    C.mod1 = M2 * M3; C.fmax1 = (u32)((B - 1) / 7); break;
-                case 5:
-                    r1 = classes_e_cls5(rt, B);    C.mod1 = M3; C.fmax1 = (u32)((B - 1) / 14);
-                    r2 = classes_d_cls5(rt, B, u);   C.mod2 = M2; C.fmax2 = (u32)((B - 1) / 21);
-                    break;
-            }
-            C.nres1 = (u32)r1.size();
-            for (size_t i = 0; i < r1.size() && i < 24; ++i) C.res[i] = (u32)r1[i];
-            C.nres2 = (u32)r2.size();
-            for (size_t i = 0; i < r2.size() && C.nres1 + i < 24; ++i) C.res[C.nres1 + i] = (u32)r2[i];
+    const u32 lim = (u32)((B - 1) / 42);
+
+    // lift residue classes (mod m) to actual values <= maxv
+    const auto lift = [](const std::vector<long long>& res, long long m, long long maxv) {
+        std::vector<long long> v;
+        for (long long r : res) {
+            long long x = r % m;
+            if (x == 0) x = m;
+            for (; x <= maxv; x += m) v.push_back(x);
         }
-        out.push_back(C);
+        std::sort(v.begin(), v.end());
+        return v;
+    };
+    // find4 c4-window (c4 = largest of the four seeds)
+    const auto set_window = [&](GpuCand& C, i128 Q) -> bool {
+        const long long hi4 = std::min(iroot6_i128(Q), (long long)C.lim);
+        long long lo4 = (long long)(hi4 * 0.7937005260);   // 4^(-1/6)
+        if (lo4 < 1) lo4 = 1;
+        while (4 * ipow6(lo4) < Q) ++lo4;
+        while (lo4 > 1 && 4 * ipow6(lo4 - 1) >= Q) --lo4;
+        if (lo4 > hi4) return false;
+        C.c4lo = (u32)lo4; C.c4hi = (u32)hi4;
+        return true;
+    };
+
+    if (cls <= 4) {
+        // actual values of the class anchor term u, in the [lo,hi] band
+        std::vector<long long> uvals;
+        if (cls == 4) {
+            // u = 7x: x runs over the 24 classes mod 46656 with (7x)^6≡B^6 (2^6,3^6).
+            // (u odd, ~3 from x; 7|u automatic.) seeds616(4) returns x-classes.
+            for (long long x : lift(seeds616(rt, B, 4), M2 * M3, (B - 1) / 7)) {
+                const long long u = 7 * x;
+                if (u >= lo && u <= hi) uvals.push_back(u);
+            }
+        } else {
+            const std::vector<long long> seeds = seeds616(rt, B, cls);
+            const long long M = mod616(cls);
+            for (long long s : seeds) {
+                long long u0 = s % M;
+                if (u0 < lo) u0 += (lo - u0 + M - 1) / M * M;
+                for (long long u = u0; u <= hi; u += M)
+                    if (unit_ok616(u, cls)) uvals.push_back(u);
+            }
+        }
+        std::sort(uvals.begin(), uvals.end());
+        uvals.erase(std::unique(uvals.begin(), uvals.end()), uvals.end());
+        for (long long u : uvals) {
+            const i128 u6 = ipow6(u);
+            if (u6 >= B6) continue;
+            {
+                if (cls == 1) {
+                    // {o37}: Q0 = (B^6-u^6)/42^6; the sixth term 42w gets the w-loop
+                    const i128 R = B6 - u6;
+                    if (R % M42 != 0) continue;              // guaranteed by seeds
+                    const i128 Q0 = R / M42;
+                    const long long wmax = std::min((long long)lim, iroot6_i128(Q0 - 4));
+                    for (long long w = 1; w <= wmax; ++w) {
+                        const i128 Q = Q0 - ipow6(w);
+                        if (Q < 4) break;
+                        GpuCand C{};
+                        C.B = (u32)B; C.u = (u32)u; C.cls = 1; C.lim = lim; C.w = (u32)(42 * w);
+                        C.q_lo = (u64)Q; C.q_hi = (u64)((u128)Q >> 64);
+                        if (set_window(C, Q)) out.push_back(C);
+                    }
+                } else {
+                    long long f; std::vector<long long> vres; long long vmod, vmax;
+                    if (cls == 2) {      // {o7}|{3}: v=14v', (14v')^6≡B^6 (3^6)
+                        f = 14; vres = classes_d_cls2(rt, B); vmod = M3; vmax = (B - 1) / 14;
+                    } else if (cls == 3) { // {37}|{o}: v=21v', (21v')^6≡B^6-u^6 (2^6)
+                        f = 21; vres = classes_d_cls3(rt, B, u); vmod = M2; vmax = (B - 1) / 21;
+                    } else {               // {o3}|{7}: v=6v', (6v')^6≡B^6 (7^6)
+                        f = 6; vres = scaled_roots(rt.r7, mod_pow6(B, M7), 6, M7); vmod = M7; vmax = (B - 1) / 6;
+                    }
+                    for (long long v : lift(vres, vmod, vmax)) {
+                        const i128 R = B6 - u6 - ipow6(f * v);
+                        if (R <= 0 || R % M42 != 0) continue;   // guaranteed by construction
+                        const i128 Q = R / M42;
+                        if (Q < 4) continue;
+                        GpuCand C{};
+                        C.B = (u32)B; C.u = (u32)u; C.cls = (u32)cls; C.lim = lim; C.w = (u32)(f * v);
+                        C.q_lo = (u64)Q; C.q_hi = (u64)((u128)Q >> 64);
+                        C.q504 = (u32)(long long)(Q % 504); C.q247 = (u32)(long long)(Q % 247);
+                        if (set_window(C, Q)) out.push_back(C);
+                    }
+                }
+            }
+        }
+    } else {
+        // cls5 {o}|{3}|{7}: u=14u' (~3), w=6v' (~7); kernel grids w'=21w' (odd, mod 64)
+        const std::vector<long long> wres = scaled_roots(rt.r2, mod_pow6(B, M2), 21, M2);
+        const std::vector<long long> ures = classes_d_cls2(rt, B);                       // (14u')^6≡B^6 (3^6)
+        const std::vector<long long> vres = scaled_roots(rt.r7, mod_pow6(B, M7), 6, M7); // (6v')^6≡B^6 (7^6)
+        for (long long up : lift(ures, M3, (B - 1) / 14)) {
+            const long long u = 14 * up;
+            if (u < lo || u > hi) continue;                  // band applies to the u-term
+            const i128 u6 = ipow6(u);
+            for (long long vp : lift(vres, M7, (B - 1) / 6)) {
+                const i128 base = B6 - u6 - ipow6(6 * vp);
+                if (base <= 0) continue;
+                GpuCand C{};
+                C.B = (u32)B; C.u = (u32)u; C.cls = 5; C.lim = lim; C.w = (u32)(6 * vp);
+                C.q_lo = (u64)base; C.q_hi = (u64)((u128)base >> 64);
+                C.mod1 = M2; C.fmax1 = (u32)((B - 1) / 21);
+                C.nres1 = (u32)wres.size();
+                for (size_t i = 0; i < wres.size() && i < 24; ++i) C.res[i] = (u32)wres[i];
+                out.push_back(C);
+            }
+        }
     }
 }
+
+#ifndef HOST_ONLY
 
 // ------------------------------------------------------------ GPU run/drain --
 struct RunResult {
@@ -863,101 +905,92 @@ static RunResult gpu_run(GpuCtx& g, int cls, const std::vector<GpuCand>& v, u64 
     P.probes = g.d_probes;
     P.cands = g.d_cands; P.n_cand = (u32)v.size();
     P.inv216 = inv216;
-    P.factor = (cls == 2) ? 14 : (cls == 3) ? 21 : (cls == 4) ? 7 : 0;
+    P.factor = (cls == 5) ? 21 : 0;
     P.use_gate = (g.gate_ready && g.gate_on) ? 1u : 0u;
     P.g504 = g.d_g504; P.g247 = g.d_g247; P.p6504 = g.d_p6504; P.p6247 = g.d_p6247;
     P.calls = g.d_calls; P.gated = g.d_gated;
     P.c_m504 = g.c_m504; P.c_m247 = g.c_m247; P.inv42_247 = g.inv42_247;
 
     u32 ymax = 1;
-    if (cls == 1) ymax = 32;                       // 2048-c4 chunks (window <= ~11k)
+    if (cls <= 4) ymax = 32;                       // 2048-c4 chunks (window <= ~11k at N=65535)
     else {
         for (const auto& C : v) {
             const u32 f = C.nres1 * (C.fmax1 / C.mod1 + 1);
             if (f > ymax) ymax = f;
         }
     }
-    const dim3 grid((u32)v.size(), ymax), block(256);
     const auto t0 = Clock::now();
-    if (cls == 1)      k_cls1<<<grid, block>>>(P);
-    else if (cls == 5) k_cls5<<<grid, block>>>(P);
-    else               k_cls234<<<grid, block>>>(P);
+    if (cls <= 4) k_cls1<<<dim3((u32)v.size(), ymax), 256>>>(P);
+    else          k_cls234<<<dim3((u32)v.size(), ymax), 256>>>(P);
     CU(cudaGetLastError());
     CU(cudaDeviceSynchronize());
-    R.kernel_ms = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - t0).count();
+    R.kernel_ms = std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - t0).count() / 1e3;
 
-    u32 h_ovf = 0;
-    CU(cudaMemcpy(&R.raw_count, g.d_hitc, sizeof(u32), cudaMemcpyDeviceToHost));
-    CU(cudaMemcpy(&h_ovf, g.d_overflow, sizeof(u32), cudaMemcpyDeviceToHost));
+    u32 hc = 0, of = 0;
+    CU(cudaMemcpy(&hc, g.d_hitc, sizeof(u32), cudaMemcpyDeviceToHost));
+    CU(cudaMemcpy(&of, g.d_overflow, sizeof(u32), cudaMemcpyDeviceToHost));
     CU(cudaMemcpy(&R.probes, g.d_probes, sizeof(u64), cudaMemcpyDeviceToHost));
     CU(cudaMemcpy(&R.calls, g.d_calls, sizeof(u64), cudaMemcpyDeviceToHost));
     CU(cudaMemcpy(&R.gated, g.d_gated, sizeof(u64), cudaMemcpyDeviceToHost));
-    R.overflow = (h_ovf != 0);
-    const u32 n = std::min(R.raw_count, g.hit_cap);
-    R.hits.resize(n);
-    if (n) CU(cudaMemcpy(R.hits.data(), g.d_hits, n * sizeof(Hit), cudaMemcpyDeviceToHost));
+    R.raw_count = hc;
+    R.overflow = (of != 0);
+    const u32 kept = std::min(hc, g.hit_cap);
+    R.hits.resize(kept);
+    if (kept) CU(cudaMemcpy(R.hits.data(), g.d_hits, kept * sizeof(Hit), cudaMemcpyDeviceToHost));
+    if (R.overflow)
+        fprintf(stderr, "[gpu] WARNING: hit buffer overflow (%u hits > cap %u) — raise --hit-cap\n", hc, g.hit_cap);
     return R;
+}
+
+#endif // HOST_ONLY
+
+// -------------------------------------------------- 21^6 inverse mod 2^64 --
+// Newton iteration: x <- x(2 - a x) doubles correct bits; start x = a (mod 8).
+static u64 inv216_mod_2_64() {
+    u64 a = (u64)M21, x = a;
+    for (int i = 0; i < 6; ++i) x = x * (2 - a * x);   // wrapping u64 arithmetic
+    return x;
 }
 
 // ------------------------------------------------------------- verification --
 // Returns 0 = fingerprint false positive, 1 = exact decomposition but tuple
-// rejected (non-distinct / >= B / mod-300), 2 = SOLUTION.
+// rejected (non-distinct / out of range), 2 = SOLUTION.
 static int verify_hit(const GpuCand& C, const Hit& H, long& solutions,
-                      std::set<std::array<long long, 5>>& reported) {
+                      std::set<std::array<long long, 6>>& reported) {
     const int cls = (int)C.cls;
-    const u128 a6 = (u128)ipow6(H.a), b6 = (u128)ipow6(H.b);
+    const u128 a6 = (u128)ipow6(H.a), b6 = (u128)ipow6(H.b), c6 = (u128)ipow6(H.c);
     const u128 q = ((u128)C.q_hi << 64) | C.q_lo;
-    std::array<long long, 5> t;
+    std::array<long long, 6> t;
     bool exact = false;
-    switch (cls) {
-        case 1: {
-            const u128 s = a6 + b6 + (u128)ipow6(H.c) + (u128)ipow6(H.d);   // < 2^98, safe
-            exact = (s == q);
-            t = {42LL * H.a, 42LL * H.b, 42LL * H.c, 42LL * H.d, (long long)C.u};
-            break;
+    if (cls <= 4) {
+        // q = Q: the find4 target, divided exactly on the host.
+        exact = (a6 + b6 + c6 + (u128)ipow6(H.d) == q);
+        t = {42LL * H.a, 42LL * H.b, 42LL * H.c, 42LL * H.d, (long long)C.w, (long long)C.u};
+    } else {
+        // q = base = B^6-(14u')^6-(6v')^6; H.c = c3, H.d = w' (grid term 21w').
+        const u128 g6 = (u128)ipow6(21LL * H.d);
+        if (g6 <= q) {
+            const u128 rhs = q - g6;
+            exact = (rhs % (u128)M42 == 0) && (a6 + b6 + c6 == rhs / (u128)M42);
         }
-        case 2: case 3: case 4: {
-            // exact <=> a^6+b^6+c^6 == (q - (f d)^6)/42^6, checked without
-            // ever forming the 42^6-multiple (would overflow u128).
-            const long long f = (cls == 2) ? 14 : (cls == 3) ? 21 : 7;
-            const u128 fd6 = (u128)ipow6(f * (long long)H.d);
-            if (fd6 <= q) {
-                const u128 rhs = q - fd6;
-                exact = (rhs % (u128)M42 == 0) && (a6 + b6 + (u128)ipow6(H.c) == rhs / (u128)M42);
-            }
-            t = {42LL * H.a, 42LL * H.b, 42LL * H.c, f * (long long)H.d, (long long)C.u};
-            break;
-        }
-        case 5: {
-            const u128 d6 = (u128)ipow6(21LL * H.c), e6 = (u128)ipow6(14LL * H.d);
-            if (d6 <= q && e6 <= q - d6) {
-                const u128 rhs = q - d6 - e6;
-                exact = (rhs % (u128)M42 == 0) && (a6 + b6 == rhs / (u128)M42);
-            }
-            t = {42LL * H.a, 42LL * H.b, 21LL * H.c, 14LL * H.d, (long long)C.u};
-            break;
-        }
+        t = {42LL * H.a, 42LL * H.b, 42LL * H.c, 21LL * H.d, (long long)C.u, (long long)C.w};
     }
     if (!exact) return 0;
     std::sort(t.begin(), t.end());
-    for (int i = 0; i < 4; ++i) if (t[i] == t[i + 1]) return 1;
+    for (int i = 0; i < 5; ++i) if (t[i] == t[i + 1]) return 1;
     if (t.back() >= (long long)C.B || t.front() < 1) return 1;
-#if HAVE_MOD60
-    static mod60::SixthPowerFilter300 f300;
-    if (!f300.passes((long long)C.B, {t[0], t[1], t[2], t[3], t[4]})) return 1;
-#endif
-    i128 lhs = ipow6((long long)C.B);       // subtractive: partial sums stay in
-    for (long long x : t) {                 // (-B^6, B^6), no i128 overflow
+    i128 lhs = ipow6((long long)C.B);       // subtractive: bail at first
+    for (long long x : t) {                 // negative, so |lhs| < B^6 always
         lhs -= ipow6(x);
         if (lhs < 0) return 1;
     }
     if (lhs != 0) return 1;
     if (reported.insert(t).second) {
         long long g = std::gcd(t[0], t[1]);
-        for (int i = 2; i < 5; ++i) g = std::gcd(g, t[i]);
+        for (int i = 2; i < 6; ++i) g = std::gcd(g, t[i]);
         g = std::gcd(g, (long long)C.B);
-        printf("SOLUTION cls=%d B=%u a1=%lld a2=%lld a3=%lld a4=%lld a5=%lld (unit=%u) gcd=%lld %s\n",
-               cls, C.B, t[0], t[1], t[2], t[3], t[4], C.u, g, g == 1 ? "primitive" : "NON-PRIMITIVE");
+        printf("SOLUTION cls=%d B=%u a1=%lld a2=%lld a3=%lld a4=%lld a5=%lld a6=%lld (anchor=%u) gcd=%lld %s\n",
+               cls, C.B, t[0], t[1], t[2], t[3], t[4], t[5], C.u, g, g == 1 ? "primitive" : "NON-PRIMITIVE");
         fflush(stdout);
         fprintf(stderr, "%u\tSOLUTION\tcls=%d\n", C.B, cls);
     }
@@ -971,20 +1004,28 @@ static int verify_hit(const GpuCand& C, const Hit& H, long& solutions,
 static u128 h_pow6_128(u32 x) { return (u128)ipow6(x); }   // host mirror reference
 
 static bool selftest_host(const RootTables& rt, u64 inv216) {
-    fprintf(stderr, "[selftest] host math\n");
-    // (a) seeds satisfy the master congruences (as v2)
-    srand(615);
+    fprintf(stderr, "[selftest] host math (616)\n");
+    // (a) every seed class satisfies its defining congruences
+    srand(616);
     for (int trial = 0; trial < 200; ++trial) {
         long long B = 1000 + rand() % 2000000;
         while (B % 2 == 0 || B % 3 == 0 || B % 7 == 0) ++B;
-        for (int cls = 1; cls <= 5; ++cls)
-            for (long long s : seeds_for_B(rt, B, cls)) {
-                bool ok = mod_pow6(s, M7) == mod_pow6(B, M7);
-                if (cls == 1) ok = ok && mod_pow6(s, M2) == mod_pow6(B, M2) && mod_pow6(s, M3) == mod_pow6(B, M3);
-                if (cls == 2) ok = ok && mod_pow6(s, M2) == mod_pow6(B, M2);
-                if (cls == 3) ok = ok && mod_pow6(s, M3) == mod_pow6(B, M3);
-                if (!ok) { fprintf(stderr, "seed fail cls=%d B=%lld\n", cls, B); return false; }
-            }
+        const long long b2 = mod_pow6(B, M2), b3 = mod_pow6(B, M3), b7 = mod_pow6(B, M7);
+        for (long long s : seeds616(rt, B, 1))
+            if (mod_pow6(s, M2) != b2 || mod_pow6(s, M3) != b3 || mod_pow6(s, M7) != b7
+                || !(s & 1) || std::gcd(s, 42LL) != 1) { fprintf(stderr, "seed fail cls=1 B=%lld\n", B); return false; }
+        for (long long s : seeds616(rt, B, 2))
+            if (mod_pow6(s, M2) != b2 || mod_pow6(s, M7) != b7 || !(s & 1)) { fprintf(stderr, "seed fail cls=2 B=%lld\n", B); return false; }
+        for (long long s : seeds616(rt, B, 3))
+            if (mod_pow6(s, M3) != b3 || mod_pow6(s, M7) != b7 || std::gcd(s, 21LL) != 1) { fprintf(stderr, "seed fail cls=3 B=%lld\n", B); return false; }
+        for (long long x : seeds616(rt, B, 4))   // x-classes of the u=7x anchor
+            if (mod_pow6(7 * x, M2) != b2 || mod_pow6(7 * x, M3) != b3) { fprintf(stderr, "seed fail cls=4 B=%lld\n", B); return false; }
+        for (long long s : classes_d_cls2(rt, B))
+            if (mod_pow6(14 * s, M3) != b3) { fprintf(stderr, "seed fail cls=5u B=%lld\n", B); return false; }
+        for (long long s : scaled_roots(rt.r7, b7, 6, M7))
+            if (mod_pow6(6 * s, M7) != b7) { fprintf(stderr, "seed fail cls=5v B=%lld\n", B); return false; }
+        for (long long s : scaled_roots(rt.r2, b2, 21, M2))
+            if (mod_pow6(21 * s, M2) != b2) { fprintf(stderr, "seed fail cls=5w B=%lld\n", B); return false; }
     }
     // (b) 21^6 inverse
     if ((u64)((u128)M21 * inv216) != 1) { fprintf(stderr, "inv216 wrong\n"); return false; }
@@ -1007,7 +1048,9 @@ static bool selftest_host(const RootTables& rt, u64 inv216) {
         const long long r = iroot6_i128(n);
         if (ipow6(r) > n || ipow6(r + 1) <= n) { fprintf(stderr, "iroot6 fail n=%lld\n", n); return false; }
     }
-    // (f) probe gate: bitmaps must be exactly the pair-sum sets mod 504/247
+    // (g) probe gate: bitmaps must be exactly the pair-sum sets mod 504/247,
+    //     of sizes 27 (3 mod 8 x 3 mod 9 x 3 mod 7) and 50 (5 mod 13 x 10 mod
+    //     19), and must pass EVERY real pair sum (soundness fuzz).
     {
         GateData gd;
         build_gate(gd);
@@ -1020,7 +1063,7 @@ static bool selftest_host(const RootTables& rt, u64 inv216) {
         }
         for (int t = 0; t < 200000; ++t) {
             const u32 i = 1 + rand() % 65535, j = 1 + rand() % 65535;
-            const u128 s = h_pow6_128(i) + h_pow6_128(j);
+            const u128 s = h_pow6_128(i) + h_pow6_128(j);   // exact (not wrapped!)
             if (!gate_get(gd.g504, (int)(long long)(s % 504)) || !gate_get(gd.g247, (int)(long long)(s % 247))) {
                 fprintf(stderr, "gate soundness fail i=%u j=%u\n", i, j);
                 return false;
@@ -1029,9 +1072,66 @@ static bool selftest_host(const RootTables& rt, u64 inv216) {
         fprintf(stderr, "[selftest] probe gate: 27+50 residues, keep=%.3f%%, soundness fuzz OK\n",
                 100.0 * 27.0 * 50.0 / 124488.0);
     }
+    // (f) candidate-generation identities — the machine-checked proof of the
+    //     new class math: EVERY emitted candidate must satisfy its defining
+    //     identity exactly (u128):
+    //       cls1-4: u^6 + w^6 + 42^6 * Q == B^6   (Q = find4 target)
+    //       cls5:   u^6 + w^6 + base   == B^6   (base = find3 base)
+    //     plus every class must actually produce candidates somewhere.
+    long long tot[6] = {0};
+    const auto check_ids = [&](long long B) -> bool {
+        const u128 B6 = (u128)ipow6(B);
+        for (int cls = 1; cls <= 5; ++cls) {
+            std::vector<GpuCand> v;
+            gen_class_cands(rt, B, cls, 0.0, 1.0, v);
+            long long checked = 0;
+            for (const GpuCand& C : v) {
+                const u128 q = ((u128)C.q_hi << 64) | C.q_lo;
+                const bool ok = (cls <= 4)
+                    ? ((u128)ipow6(C.u) + (u128)ipow6(C.w) + (u128)M42 * q == B6)
+                    : ((u128)ipow6(C.u) + (u128)ipow6(C.w) + q == B6);
+                if (!ok) {
+                    fprintf(stderr, "gen identity fail cls=%d B=%lld u=%u w=%u\n", cls, B, C.u, C.w);
+                    return false;
+                }
+                if (++checked >= 300) break;      // cap per (B, cls); totals use v.size()
+            }
+            tot[cls] += (long long)v.size();
+        }
+        return true;
+    };
+    // phase 1: small B (dense coverage of the small-modulus classes 4 and 5)
+    for (long long B = 1009; B <= 62000; B += 260) {
+        if (!(B & 1) || B % 3 == 0 || B % 7 == 0) continue;
+        if (!check_ids(B)) return false;
+    }
+    if (tot[4] == 0 || tot[5] == 0) { fprintf(stderr, "gen smoke: no cls4/cls5 candidates at small B\n"); return false; }
+    // phase 2: large B near the i128 ceiling, so the big-modulus classes
+    // (cls2 mod 14^6, cls3 mod 21^6) materialize anchors.
+    srand(4242);
+    for (int t = 0; t < 60; ++t) {
+        long long B = 2250001 + rand() % 100000;
+        while (B % 2 == 0 || B % 3 == 0 || B % 7 == 0) ++B;
+        if (B > B_HARD_MAX) continue;
+        if (!check_ids(B)) return false;
+    }
+    if (tot[2] == 0 || tot[3] == 0) { fprintf(stderr, "gen smoke: no cls2/cls3 candidates at large B\n"); return false; }
+    // cls1 anchors are the rarest (144 classes mod 42^6 ~ 5.5e9): scan upward
+    // deterministically until a B with a cls1 candidate turns up, then check it.
+    for (long long B = 2250001; tot[1] == 0 && B <= B_HARD_MAX - 400; B += 2) {
+        if (!(B & 1) || B % 3 == 0 || B % 7 == 0) continue;
+        std::vector<GpuCand> v;
+        gen_class_cands(rt, B, 1, 0.0, 1.0, v);
+        if (!v.empty() && !check_ids(B)) return false;
+    }
+    if (tot[1] == 0) { fprintf(stderr, "gen smoke: no cls1 candidate found in scan\n"); return false; }
+    fprintf(stderr, "[selftest] gen smoke candidates: c1=%lld c2=%lld c3=%lld c4=%lld c5=%lld\n",
+            tot[1], tot[2], tot[3], tot[4], tot[5]);
     fprintf(stderr, "[selftest] host math OK\n");
     return true;
 }
+
+#ifndef HOST_ONLY
 
 // ------------------------------------------------------- GPU plant tests --
 // Build a small table, plant known targets, require the kernels to find them.
@@ -1043,7 +1143,7 @@ static bool selftest_gpu(GpuCtx& g, u64 inv216) {
     gpu_upload_table(g, slots, S);
     GateData gd;
     build_gate(gd);
-    gpu_upload_gate(g, gd);
+    gpu_upload_gate(g, gd);   // plants double as the gate soundness test
 
     // -- pair plant: 20000 random pairs must all be found by k_probe_test --
     {
@@ -1083,14 +1183,11 @@ static bool selftest_gpu(GpuCtx& g, u64 inv216) {
             const GpuCand& C = cands[H.cand];
             const u128 a6 = h_pow6_128(H.a), b6 = h_pow6_128(H.b);
             bool ex = false;
-            if (cls == 1) ex = (a6 + b6 + h_pow6_128(H.c) + h_pow6_128(H.d) == targets[H.cand]);
-            else if (cls == 5) {
-                const u128 base = ((u128)C.q_hi << 64) | C.q_lo;
-                ex = ((u128)M42 * (a6 + b6) + h_pow6_128(21 * H.c) + h_pow6_128(14 * H.d) == base);
+            if (cls <= 4) {
+                ex = (a6 + b6 + h_pow6_128(H.c) + h_pow6_128(H.d) == targets[H.cand]);
             } else {
                 const u128 base = ((u128)C.q_hi << 64) | C.q_lo;
-                const long long f = (cls == 2) ? 14 : (cls == 3) ? 21 : 7;
-                ex = ((u128)M42 * (a6 + b6 + h_pow6_128(H.c)) + h_pow6_128(f * (long long)H.d) == base);
+                ex = ((u128)M42 * (a6 + b6 + h_pow6_128(H.c)) + h_pow6_128(21 * H.d) == base);
             }
             if (ex) got[H.cand] = 1;
         }
@@ -1100,7 +1197,7 @@ static bool selftest_gpu(GpuCtx& g, u64 inv216) {
     };
 
     srand(777);
-    // -- cls1 plant: Q = sum of 4 distinct sixth powers --
+    // -- find4 plant (cls1-4 shape): Q = sum of 4 distinct sixth powers --
     {
         const int T = 512;
         std::vector<GpuCand> cands(T);
@@ -1111,21 +1208,21 @@ static bool selftest_gpu(GpuCtx& g, u64 inv216) {
             while (cs[0] == cs[1] || cs[0] == cs[2] || cs[0] == cs[3] || cs[1] == cs[2] || cs[1] == cs[3] || cs[2] == cs[3]);
             const i128 Q = ipow6(cs[0]) + ipow6(cs[1]) + ipow6(cs[2]) + ipow6(cs[3]);
             GpuCand C{};
-            C.cls = 1; C.B = 42 * N + 1; C.u = 1; C.lim = N;
+            C.cls = 1; C.B = 42 * N + 1; C.u = 1; C.w = 0; C.lim = N;
             C.q_lo = (u64)Q; C.q_hi = (u64)((u128)Q >> 64);
+            C.q504 = (u32)(long long)(Q % 504); C.q247 = (u32)(long long)(Q % 247);
             const long long hi4 = std::min(iroot6_i128(Q), (long long)N);
             long long lo4 = (long long)(hi4 * 0.7937005260); if (lo4 < 1) lo4 = 1;
             while (4 * ipow6(lo4) < Q) ++lo4;
             while (lo4 > 1 && 4 * ipow6(lo4 - 1) >= Q) --lo4;
             C.c4lo = (u32)lo4; C.c4hi = (u32)hi4;
-            C.q504 = (u32)(long long)(Q % 504); C.q247 = (u32)(long long)(Q % 247);
             cands[t] = C; targets[t] = (u128)Q;
         }
         const int got = run_and_count_exact(1, cands, targets);
-        fprintf(stderr, "[plant] cls1: %d/%d\n", got, T);
+        fprintf(stderr, "[plant] find4 (cls1 shape): %d/%d\n", got, T);
         if (got != T) return false;
     }
-    // -- cls234 plant (factor 14): base = (14d)^6 + 42^6(i^6+j^6+k^6) --
+    // -- find3 plant (cls5 shape): base = (21w)^6 + 42^6(i^6+j^6+k^6) --
     {
         const int T = 512;
         std::vector<GpuCand> cands(T);
@@ -1135,45 +1232,25 @@ static bool selftest_gpu(GpuCtx& g, u64 inv216) {
             int cs[3];
             do { for (int k = 0; k < 3; ++k) cs[k] = 1 + rand() % N; }
             while (cs[0] == cs[1] || cs[0] == cs[2] || cs[1] == cs[2]);
-            const u128 base = (u128)ipow6(14LL * d) + (u128)M42 * ((u128)ipow6(cs[0]) + ipow6(cs[1]) + ipow6(cs[2]));
+            const u128 base = (u128)ipow6(21LL * d) + (u128)M42 * ((u128)ipow6(cs[0]) + ipow6(cs[1]) + ipow6(cs[2]));
             GpuCand C{};
-            C.cls = 2; C.B = 42 * N + 1; C.u = 1; C.lim = N;
+            C.cls = 5; C.B = 42 * N + 1; C.u = 14; C.w = 6; C.lim = N;
             C.q_lo = (u64)base; C.q_hi = (u64)(base >> 64);
-            C.mod1 = M3; C.fmax1 = (u32)d; C.nres1 = 1; C.res[0] = (u32)(d % M3);
-            cands[t] = C; targets[t] = base;
-        }
-        const int got = run_and_count_exact(2, cands, targets);
-        fprintf(stderr, "[plant] cls234: %d/%d\n", got, T);
-        if (got != T) return false;
-    }
-    // -- cls5 plant: base = (14e)^6 + (21d)^6 + 42^6(i^6+j^6) --
-    {
-        const int T = 512;
-        std::vector<GpuCand> cands(T);
-        std::vector<u128> targets(T);
-        for (int t = 0; t < T; ++t) {
-            const int e = 1 + rand() % 280, d = 1 + rand() % 190;
-            int i, j;
-            do { i = 1 + rand() % N; j = 1 + rand() % N; } while (i == j);
-            const u128 base = (u128)ipow6(14LL * e) + (u128)ipow6(21LL * d)
-                            + (u128)M42 * ((u128)ipow6(i) + ipow6(j));
-            GpuCand C{};
-            C.cls = 5; C.B = 42 * N + 1; C.u = 1; C.lim = N;
-            C.q_lo = (u64)base; C.q_hi = (u64)(base >> 64);
-            C.mod1 = M3; C.fmax1 = (u32)e; C.nres1 = 1; C.res[0] = (u32)(e % M3);
-            C.mod2 = M2; C.fmax2 = (u32)d; C.nres2 = 1; C.res[1] = (u32)(d % M2);
+            C.mod1 = M2; C.fmax1 = (u32)d; C.nres1 = 1; C.res[0] = (u32)(d % M2);
             cands[t] = C; targets[t] = base;
         }
         const int got = run_and_count_exact(5, cands, targets);
-        fprintf(stderr, "[plant] cls5: %d/%d\n", got, T);
+        fprintf(stderr, "[plant] find3 (cls5 shape): %d/%d\n", got, T);
         if (got != T) return false;
     }
     fprintf(stderr, "[selftest] GPU plant tests OK\n");
     return true;
 }
 
+#endif // HOST_ONLY
+
 // =============================================================================
-// XCHECK — CPU reference finders (v2 logic) vs GPU kernels, same candidates.
+// XCHECK — CPU reference finders vs GPU kernels, same candidates.
 // Requires quad_sum.hpp (+k14_common.hpp). Limited to B_max <= 600000 so the
 // CPU pair index fits comfortably next to the GPU table.
 // =============================================================================
@@ -1222,33 +1299,13 @@ static std::optional<std::array<int, 4>> xc_find4(const QuadSumIndex& ix, i128 Q
 static bool xc_cpu_found(const QuadSumIndex& ix, const GpuCand& C) {
     const i128 q = ((i128)(u128)C.q_hi << 64) | (i128)(u128)C.q_lo;
     const int lim = (int)C.lim;
-    if (C.cls == 1) return xc_find4(ix, q, lim).has_value();
-    if (C.cls == 5) {
-        const i128 base = q;
-        const u32 k1 = C.fmax1 / C.mod1 + 1;
-        for (u32 t1 = 0; t1 < C.nres1 * k1; ++t1) {
-            const u32 e = C.res[t1 % C.nres1] + (t1 / C.nres1) * C.mod1;
-            if (!e || e > C.fmax1) continue;
-            const i128 R1 = base - ipow6(14LL * e);
-            if (R1 <= 0) continue;
-            const u32 k2 = C.fmax2 / C.mod2 + 1;
-            for (u32 t2 = 0; t2 < C.nres2 * k2; ++t2) {
-                const u32 d = C.res[C.nres1 + t2 % C.nres2] + (t2 / C.nres2) * C.mod2;
-                if (!d || d > C.fmax2) continue;
-                const i128 R = R1 - ipow6(21LL * d);
-                if (R <= 0 || R % M42 != 0) continue;
-                if (xc_find2(ix, R / M42, lim)) return true;
-            }
-        }
-        return false;
-    }
-    const long long f = (C.cls == 2) ? 14 : (C.cls == 3) ? 21 : 7;
-    const i128 base = q;
+    if (C.cls <= 4) return xc_find4(ix, q, lim).has_value();
+    // cls5: q = base; replay the kernel's w' grid exactly.
     const u32 k1 = C.fmax1 / C.mod1 + 1;
     for (u32 t1 = 0; t1 < C.nres1 * k1; ++t1) {
-        const u32 d = C.res[t1 % C.nres1] + (t1 / C.nres1) * C.mod1;
-        if (!d || d > C.fmax1) continue;
-        const i128 R = base - ipow6(f * (long long)d);
+        const u32 w = C.res[t1 % C.nres1] + (t1 / C.nres1) * C.mod1;
+        if (!w || w > C.fmax1) continue;
+        const i128 R = q - ipow6(21LL * w);
         if (R <= 0 || R % M42 != 0) continue;
         if (xc_find3(ix, R / M42, lim)) return true;
     }
@@ -1259,6 +1316,15 @@ static bool xc_cpu_found(const QuadSumIndex& ix, const GpuCand& C) {
 // =============================================================================
 // MAIN
 // =============================================================================
+#ifdef HOST_ONLY
+int main() {
+    const RootTables rt;
+    const u64 inv216 = inv216_mod_2_64();
+    if (!selftest_host(rt, inv216)) { fprintf(stderr, "SELFTEST FAIL (host)\n"); return 1; }
+    fprintf(stderr, "SELFTEST PASS (host-only build; run the nvcc build on the server for GPU tests)\n");
+    return 0;
+}
+#else
 int main(int argc, char** argv) {
     // ---- argument parsing ----
     std::vector<std::string> pos;
@@ -1294,22 +1360,21 @@ int main(int argc, char** argv) {
         if (ndev < 1) { fprintf(stderr, "[selftest] no GPU — host part only, PASS\n"); return 0; }
         GpuCtx g;
         gpu_init(g, device, 1u << 16);
-        GateData gd;
-        build_gate(gd);
-        gpu_upload_gate(g, gd);
         if (!selftest_gpu(g, inv216)) { fprintf(stderr, "SELFTEST FAIL (GPU)\n"); return 1; }
         fprintf(stderr, "SELFTEST PASS\n");
         return 0;
     }
 
     if (pos.size() < 2 && bench_chunks > 0) {
-        // bare "--bench [K]": time K chunks over a representative campaign slice
-        pos.push_back("1000000");
-        pos.push_back("2200000");
+        // bare "--bench [K]": time K chunks over a representative night-1 slice
+        pos.push_back("110267");
+        pos.push_back("410000");
     }
     if (pos.size() < 2) {
         fprintf(stderr,
             "usage: %s <B_min> <B_max> [classes] [u_lo] [u_hi] [options]\n"
+            "  (6,1,6): a1^6+..+a6^6 = B^6, primitive. New ground starts at 110267\n"
+            "  (EulerNet covered <= 110266 by Jan 2000).\n"
             "  classes: \"all\" (default) or e.g. \"1,3\";  u band as fractions of B\n"
             "  options: --chunk K --device K --slots-log2 S --hit-cap N\n"
             "           --save-table F --load-table F --bench [K] --xcheck --quiet\n"
@@ -1373,8 +1438,8 @@ int main(int argc, char** argv) {
         fprintf(stderr, "[xcheck] CPU index built (N=%d); comparing engines over [%lld, %lld]\n", N, B_min, B_max);
         long long mismatch = 0, checked = 0, both_found = 0;
         long solutions = 0;
-        std::set<std::array<long long, 5>> reported;
-        for (long long B = std::max(B_min, 86LL); B <= B_max; ++B) {
+        std::set<std::array<long long, 6>> reported;
+        for (long long B = std::max(B_min, 11LL); B <= B_max; ++B) {
             if (!(B & 1) || B % 3 == 0 || B % 7 == 0) continue;
             for (int cls : classes) {
                 std::vector<GpuCand> cands;
@@ -1410,7 +1475,7 @@ int main(int argc, char** argv) {
     }
 
     // ---- normal campaign loop ----
-    fprintf(stderr, "solve_516_v3: B in [%lld, %lld], classes ", B_min, B_max);
+    fprintf(stderr, "solve_616_v1: B in [%lld, %lld], classes ", B_min, B_max);
     for (int c : classes) fprintf(stderr, "%d", c);
     fprintf(stderr, ", unit band [%.4f, %.4f)*B, chunk=%lld\n", u_lo, u_hi, chunk);
 
@@ -1418,13 +1483,13 @@ int main(int argc, char** argv) {
     long long stat_cands[6] = {0}, stat_exact[6] = {0}, stat_false[6] = {0};
     u64 stat_probes[6] = {0}, stat_calls[6] = {0}, stat_gated[6] = {0};
     double stat_ms[6] = {0};
-    std::set<std::array<long long, 5>> reported;
+    std::set<std::array<long long, 6>> reported;
 
     long long chunks_done = 0;
     for (long long c0 = B_min; c0 <= B_max; c0 += chunk) {
         const long long c1 = std::min(B_max, c0 + chunk - 1);
         std::vector<long long> Bl;
-        for (long long B = std::max(c0, 86LL); B <= c1; ++B)
+        for (long long B = std::max(c0, 11LL); B <= c1; ++B)
             if ((B & 1) && B % 3 != 0 && B % 7 != 0) Bl.push_back(B);
 
         std::vector<GpuCand> gc[6];
@@ -1466,21 +1531,13 @@ int main(int argc, char** argv) {
     }
 
     fprintf(stderr, "---- summary ----\n");
-    u64 tot_calls = 0, tot_gated = 0;
     for (int cls : classes)
-        if (stat_cands[cls]) {
-            tot_calls += stat_calls[cls];
-            tot_gated += stat_gated[cls];
-            fprintf(stderr, "cls%d: cands=%lld probes=%.4e kernel=%.1fs rate=%.2e probes/s exact=%lld fp-false=%lld",
+        if (stat_cands[cls])
+            fprintf(stderr, "cls%d: cands=%lld probes=%.4e kernel=%.1fs rate=%.2e probes/s exact=%lld fp-false=%lld gate-kill=%.2f%%\n",
                     cls, stat_cands[cls], (double)stat_probes[cls], stat_ms[cls] / 1e3,
-                    stat_probes[cls] / std::max(1e-9, stat_ms[cls] / 1e3), stat_exact[cls], stat_false[cls]);
-            if (stat_calls[cls])
-                fprintf(stderr, " gate=%.1f%%", 100.0 * stat_gated[cls] / stat_calls[cls]);
-            fprintf(stderr, "\n");
-        }
-    if (tot_calls && g.gate_on)
-        fprintf(stderr, "probe gate: %.1f%% filtered (%.4e / %.4e candidates)\n",
-                100.0 * tot_gated / tot_calls, (double)tot_gated, (double)tot_calls);
+                    stat_probes[cls] / std::max(1e-9, stat_ms[cls] / 1e3), stat_exact[cls], stat_false[cls],
+                    100.0 * (double)stat_gated[cls] / std::max(1.0, (double)(stat_gated[cls] + stat_calls[cls])));
     fprintf(stderr, "total solutions: %ld\n", solutions);
     return 0;
 }
+#endif // HOST_ONLY

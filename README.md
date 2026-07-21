@@ -129,32 +129,35 @@ to order of magnitude — the lookup layer behaves as modeled.
   support, so the binary targets `compute_90` PTX and the driver JIT-compiles
   it on first launch (small one-time pause; slightly pessimistic codegen).
   With CUDA ≥ 12.8, build natively for sm_120 instead.
-* **Build:**
-  ```
-  nvcc -O3 -std=c++17 -gencode arch=compute_90,code=compute_90 -o solve_516_v3 solve_516_v3.cu -lineinfo
-  ```
+* **Build:** `make v3` (or `make v616` for the (6,1,6) port). See `Makefile`.
 * **Validate then run:**
   ```
   ./solve_516_v3 --selftest
   ./solve_516_v3 300000 350000 all --xcheck
   ./solve_516_v3 1010231 2200000 all
   ```
+  Use `--no-gate` to disable the mod-124,488 pre-filter for A/B benchmarking.
 * Long runs: wrap with `nohup ... & disown` (see `runs/run_campaign.sh`);
   logs land in `runs/`.
 
+### 8. Mod-124,488 probe gate (v3, enabled by default)
+
+Before each hash-table lookup, kernels test whether the target residue is
+achievable as a pair sum `i⁶+j⁶` mod 124,488 (= 8·9·7·13·19, CRT-factored as
+504×247). Only ~1.08% of candidates pass; the rest die in ~20 ALU cycles.
+Sound by construction — real pair sums always pass. The same gate ships in
+`solve_616_v1.cu` for the (6,1,6) port.
+
 ## Roadmap
 
-1. **Mod-124,488 probe gate.** Pair-sum achievability mod 13 (5/13) and
-   mod 19 (10/19), combined with the existing 504 = 8·9·7 structure, gives a
-   124,488-entry bitmap (15.2 KiB) that kills 98.9% of probe streams before
-   they touch the table — a projected ~90× probe-stage speedup.
+1. **Ribbon filter** (`615-ribbon-filter-plan.md`, spike in `spike/ribbon/`):
+   shrink the 68.7 GB pair table to ~8.6 GB with one read per query.
 2. **Beyond 2¹²⁷:** CRT over 2–3 64-bit primes (or 192-bit limbs) lifts the
    B ceiling past 2.35M; with trick 1 the next milestone is B = 10⁷.
 3. **Ports of the same engine** (k=6 machinery is class-generic):
+   **(6,1,6)** — `solve_616_v1.cu` (EulerNet bound B ≤ 110,266; new ground from 110,267);
    **(6,2,4)** — sum of four sixth powers = sum of two — is *open* and has
-   exactly this MITM shape (targets become pair sums instead of B⁶−u⁶);
-   **(6,1,6)** is also open (nothing known; a 1967 bound of z > 38,300 is the
-   only published exclusion [^2^][^3^]) but costs one more free variable.
+   exactly this MITM shape (targets become pair sums instead of B⁶−u⁶).
 4. **Near-miss logging:** threshold the residual stream to tabulate record
    `|a₁⁶+…+a₅⁶ − B⁶|` minima — a byproduct worth publishing on its own.
 

@@ -1,7 +1,9 @@
 # Binaries
 solve_516_v3
 solve_516_v2
+solve_616_v1
 v3_host_logic_test
+spike/ribbon/ribbon_filter_test
 *.o
 *.out
 

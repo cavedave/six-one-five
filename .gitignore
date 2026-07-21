@@ -1,0 +1,27 @@
+# Binaries
+solve_516_v3
+solve_516_v2
+v3_host_logic_test
+*.o
+*.out
+
+# GPU pair-sum table cache (multi-GB)
+table_*.bin
+*.npz
+
+# Campaign logs and checkpoints
+runs/
+*.log
+*.stderr
+
+# Editor / OS
+.DS_Store
+.vscode/
+*.swp
+
+# Secrets (should never be committed)
+.env
+.env.*
+*.pem
+*_credentials*
+secrets.*

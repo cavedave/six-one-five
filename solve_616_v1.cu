@@ -396,6 +396,34 @@ static void build_gate(GateData& g) {
     }
 }
 
+// --------------------------------------------------- triple-sum window gate --
+// (6,1,6) cls5 only. Necessary condition on the whole find3 target
+//   T = R/42^6:  T must be writable as c1^6+c2^6+c3^6, tested ONCE per block
+// (not per c3). Sound (weaker than the per-c3 pair gate); zero false negatives.
+// Uses CRT factors 504 (=8*9*7) and 247 (=13*19) — the SAME residues the pair
+// gate already computes per block, so the triple test is just two extra bitmap
+// lookups. (Independent moduli 11 and 25 were measured to be fully dense for
+// three sixth powers — 100% pass — so they add no filtering and are omitted.)
+struct TriData {
+    u64 t504[8] = {0}, t247[4] = {0};
+    int n504 = 0, n247 = 0;   // per-modulus pass counts (for the "keeps %" diagnostic)
+};
+// Fill bitmap b with { (a^6+b^6+c^6) mod m }, computed as p3 = (p2 = sp+sp)+sp
+// over the sixth-power residue set sp. Returns the number of set bits.
+static int build_tri_set(u64* b, int m) {
+    std::vector<char> sp(m, 0), p2(m, 0), p3(m, 0);
+    for (int i = 0; i < m; ++i) sp[(int)mod_pow6(i, m)] = 1;
+    for (int a = 0; a < m; ++a) if (sp[a]) for (int c = 0; c < m; ++c) if (sp[c]) p2[(a + c) % m] = 1;
+    for (int a = 0; a < m; ++a) if (p2[a]) for (int c = 0; c < m; ++c) if (sp[c]) p3[(a + c) % m] = 1;
+    int cnt = 0;
+    for (int x = 0; x < m; ++x) if (p3[x]) { gate_set(b, x); ++cnt; }
+    return cnt;
+}
+static void build_tri_gate(TriData& t) {
+    t.n504 = build_tri_set(t.t504, 504);
+    t.n247 = build_tri_set(t.t247, 247);
+}
+
 // =============================================================================
 // DEVICE SIDE
 // =============================================================================
@@ -442,6 +470,12 @@ struct Params {
     u64 c_m504;                // 2^64 mod (504*42^6)   (cls5 T-mod reduction)
     u64 c_m247;                // 2^64 mod 247
     u64 inv42_247;             // (42^6)^{-1} mod 247
+    // --- cls5 triple-sum window gate (once-per-block; reuses t504/t247 residues) ---
+    u32 use_tri_gate;               // 0 disables it (--no-tri-gate)
+    const u64* __restrict__ t504;   // triple-sum achievability bitmaps
+    const u64* __restrict__ t247;
+    u64* __restrict__ tri_skipped;  // blocks killed by the triple-sum gate
+    u64* __restrict__ tri_total;    // blocks that reached the gate (valid window)
 };
 
 // ------------------------------------------- device 64/128-bit primitives --
@@ -525,6 +559,12 @@ __device__ __forceinline__ bool gate_pass(const GateSh& s, u32 t504, u32 t247,
     if (!((s.g504[x >> 6] >> (x & 63)) & 1ULL)) return false;
     u32 y = t247 + 247u - s.p6247[r247]; if (y >= 247u) y -= 247u;
     return (s.g247[y >> 6] >> (y & 63)) & 1ULL;
+}
+
+// Direct achievability test for the triple-sum window gate (no c3 offset —
+// the target residue is looked up as-is; sound necessary condition on T).
+__device__ __forceinline__ bool tri_get(const u64* __restrict__ b, u32 x) {
+    return (b[x >> 6] >> (x & 63)) & 1ULL;
 }
 
 __device__ u64 probe(const Params& P, u64 fp, u32 ci, u32 v3, u32 v4) {
@@ -626,10 +666,21 @@ __global__ void k_cls234(Params P) {
                     //   T mod 504 = ((R mod 504*42^6) / 42^6) mod 504
                     //   T mod 247 = (R mod 247) * (42^6)^{-1} mod 247
                     const u64 r1 = mod128_64(rhi, rlo, 504ULL * (u64)M42, P.c_m504);
-                    s_t504 = (u32)((r1 / (u64)M42) % 504ULL);
+                    const u32 my504 = (u32)((r1 / (u64)M42) % 504ULL);
+                    s_t504 = my504;
                     const u64 r2 = mod128_64(rhi, rlo, 247ULL, P.c_m247);
-                    s_t247 = (u32)(r2 * P.inv42_247 % 247ULL);
-                    s_active = 1;
+                    const u32 my247 = (u32)(r2 * P.inv42_247 % 247ULL);
+                    s_t247 = my247;
+                    // Triple-sum window gate: T must be a sum of three sixth
+                    // powers (mod 504 and 247). One test per block; sound. Reuses
+                    // the residues already computed above — no extra reductions.
+                    bool tri_ok = true;
+                    if (P.use_tri_gate) {
+                        tri_ok = tri_get(P.t504, my504) && tri_get(P.t247, my247);
+                        atomicAdd(P.tri_total, 1ULL);
+                        if (!tri_ok) atomicAdd(P.tri_skipped, 1ULL);
+                    }
+                    if (tri_ok) s_active = 1;
                 }
             }
         }
@@ -698,6 +749,12 @@ struct GpuCtx {
     u64* d_gated = nullptr;
     u64 c_m504 = 0, c_m247 = 0, inv42_247 = 0;
     bool gate_ready = false, gate_on = true;
+    // triple-sum window gate (cls5)
+    u64* d_t504 = nullptr;
+    u64* d_t247 = nullptr;
+    u64* d_tri_skipped = nullptr;
+    u64* d_tri_total = nullptr;
+    bool tri_ready = false, tri_on = true;
 };
 
 static void gpu_init(GpuCtx& g, int device, u32 hit_cap) {
@@ -748,6 +805,21 @@ static void gpu_upload_gate(GpuCtx& g, const GateData& gd) {
     g.gate_ready = true;
     fprintf(stderr, "[gpu] probe gate uploaded (mod 124,488; keeps 27*50/124488 = %.3f%% of probes)\n",
             100.0 * 27.0 * 50.0 / 124488.0);
+}
+
+static void gpu_upload_tri(GpuCtx& g, const TriData& td) {
+    CU(cudaMalloc(&g.d_t504, sizeof(td.t504)));
+    CU(cudaMalloc(&g.d_t247, sizeof(td.t247)));
+    CU(cudaMemcpy(g.d_t504, td.t504, sizeof(td.t504), cudaMemcpyHostToDevice));
+    CU(cudaMemcpy(g.d_t247, td.t247, sizeof(td.t247), cudaMemcpyHostToDevice));
+    CU(cudaMalloc(&g.d_tri_skipped, sizeof(u64)));
+    CU(cudaMalloc(&g.d_tri_total, sizeof(u64)));
+    g.tri_ready = true;
+    // Combined keep-rate = product of per-modulus densities (CRT-independent).
+    const double keep = (td.n504 / 504.0) * (td.n247 / 247.0);
+    fprintf(stderr, "[gpu] triple-sum window gate uploaded (cls5): "
+            "mod504=%d/504=%.1f%% mod247=%d/247=%.1f%% -> keeps ~%.2f%% of blocks\n",
+            td.n504, 100.0 * td.n504 / 504.0, td.n247, 100.0 * td.n247 / 247.0, 100.0 * keep);
 }
 
 #endif // HOST_ONLY
@@ -880,6 +952,8 @@ struct RunResult {
     u64 probes = 0;
     u64 calls = 0;
     u64 gated = 0;
+    u64 tri_skipped = 0;
+    u64 tri_total = 0;
     bool overflow = false;
     double kernel_ms = 0.0;
 };
@@ -898,6 +972,10 @@ static RunResult gpu_run(GpuCtx& g, int cls, const std::vector<GpuCand>& v, u64 
     CU(cudaMemset(g.d_probes, 0, sizeof(u64)));
     CU(cudaMemset(g.d_calls, 0, sizeof(u64)));
     CU(cudaMemset(g.d_gated, 0, sizeof(u64)));
+    if (g.tri_ready) {
+        CU(cudaMemset(g.d_tri_skipped, 0, sizeof(u64)));
+        CU(cudaMemset(g.d_tri_total, 0, sizeof(u64)));
+    }
 
     Params P{};
     P.tab = g.d_tab; P.mask = g.tab_slots - 1; P.S = g.S;
@@ -910,6 +988,10 @@ static RunResult gpu_run(GpuCtx& g, int cls, const std::vector<GpuCand>& v, u64 
     P.g504 = g.d_g504; P.g247 = g.d_g247; P.p6504 = g.d_p6504; P.p6247 = g.d_p6247;
     P.calls = g.d_calls; P.gated = g.d_gated;
     P.c_m504 = g.c_m504; P.c_m247 = g.c_m247; P.inv42_247 = g.inv42_247;
+    // triple-sum window gate (cls5 only)
+    P.use_tri_gate = (cls == 5 && g.tri_ready && g.tri_on) ? 1u : 0u;
+    P.t504 = g.d_t504; P.t247 = g.d_t247;
+    P.tri_skipped = g.d_tri_skipped; P.tri_total = g.d_tri_total;
 
     u32 ymax = 1;
     if (cls <= 4) ymax = 32;                       // 2048-c4 chunks (window <= ~11k at N=65535)
@@ -932,6 +1014,10 @@ static RunResult gpu_run(GpuCtx& g, int cls, const std::vector<GpuCand>& v, u64 
     CU(cudaMemcpy(&R.probes, g.d_probes, sizeof(u64), cudaMemcpyDeviceToHost));
     CU(cudaMemcpy(&R.calls, g.d_calls, sizeof(u64), cudaMemcpyDeviceToHost));
     CU(cudaMemcpy(&R.gated, g.d_gated, sizeof(u64), cudaMemcpyDeviceToHost));
+    if (P.use_tri_gate) {
+        CU(cudaMemcpy(&R.tri_skipped, g.d_tri_skipped, sizeof(u64), cudaMemcpyDeviceToHost));
+        CU(cudaMemcpy(&R.tri_total, g.d_tri_total, sizeof(u64), cudaMemcpyDeviceToHost));
+    }
     R.raw_count = hc;
     R.overflow = (of != 0);
     const u32 kept = std::min(hc, g.hit_cap);
@@ -1071,6 +1157,33 @@ static bool selftest_host(const RootTables& rt, u64 inv216) {
         }
         fprintf(stderr, "[selftest] probe gate: 27+50 residues, keep=%.3f%%, soundness fuzz OK\n",
                 100.0 * 27.0 * 50.0 / 124488.0);
+    }
+    // (h) triple-sum window gate (cls5): bitmaps must be exactly the three-sum
+    //     sets, mod 504 has 64 residues (4 mod 8 x 4 mod 9 x 4 mod 7), and EVERY
+    //     real triple a^6+b^6+c^6 must pass both bitmaps (zero false negatives).
+    {
+        TriData td;
+        build_tri_gate(td);
+        if (td.n504 != 64) {
+            fprintf(stderr, "tri gate mod504 size %d, want 64\n", td.n504);
+            return false;
+        }
+        if (td.n247 <= 0 || td.n247 >= 247) {
+            fprintf(stderr, "tri gate mod247 degenerate: %d\n", td.n247);
+            return false;
+        }
+        const auto tget = [](const u64* b, int x) { return (b[x >> 6] >> (x & 63)) & 1ULL; };
+        for (int t = 0; t < 200000; ++t) {
+            const u32 a = 1 + rand() % 65535, b = 1 + rand() % 65535, c = 1 + rand() % 65535;
+            const u128 s = h_pow6_128(a) + h_pow6_128(b) + h_pow6_128(c);   // exact
+            if (!tget(td.t504, (int)(long long)(s % 504)) || !tget(td.t247, (int)(long long)(s % 247))) {
+                fprintf(stderr, "tri gate soundness fail a=%u b=%u c=%u\n", a, b, c);
+                return false;
+            }
+        }
+        const double keep = (td.n504 / 504.0) * (td.n247 / 247.0);
+        fprintf(stderr, "[selftest] triple-sum gate: mod504=%d mod247=%d, keep~%.2f%%, soundness fuzz OK\n",
+                td.n504, td.n247, 100.0 * keep);
     }
     // (f) candidate-generation identities — the machine-checked proof of the
     //     new class math: EVERY emitted candidate must satisfy its defining
@@ -1332,13 +1445,14 @@ int main(int argc, char** argv) {
     int device = 0, slots_log2 = 0;
     u32 hit_cap = 1u << 20;
     std::string save_table, load_table;
-    bool opt_selftest = false, opt_xcheck = false, quiet = false, opt_nogate = false;
+    bool opt_selftest = false, opt_xcheck = false, quiet = false, opt_nogate = false, opt_notri = false;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--selftest") opt_selftest = true;
         else if (a == "--xcheck") opt_xcheck = true;
         else if (a == "--quiet") quiet = true;
         else if (a == "--no-gate") opt_nogate = true;
+        else if (a == "--no-tri-gate") opt_notri = true;
         else if (a == "--chunk" && i + 1 < argc) chunk = atoll(argv[++i]);
         else if (a == "--device" && i + 1 < argc) device = atoi(argv[++i]);
         else if (a == "--slots-log2" && i + 1 < argc) slots_log2 = atoi(argv[++i]);
@@ -1379,6 +1493,7 @@ int main(int argc, char** argv) {
             "  options: --chunk K --device K --slots-log2 S --hit-cap N\n"
             "           --save-table F --load-table F --bench [K] --xcheck --quiet\n"
             "           --no-gate (disable the mod-124,488 probe gate, for A/B bench)\n"
+            "           --no-tri-gate (disable the cls5 triple-sum window gate)\n"
             "           %s --selftest\n", argv[0], argv[0]);
         return 1;
     }
@@ -1401,10 +1516,14 @@ int main(int argc, char** argv) {
     GpuCtx g;
     gpu_init(g, device, hit_cap);
     g.gate_on = !opt_nogate;
+    g.tri_on = !opt_notri;
     {
         GateData gd;
         build_gate(gd);
         gpu_upload_gate(g, gd);
+        TriData td;
+        build_tri_gate(td);
+        gpu_upload_tri(g, td);
     }
 
     // ---- table: load or build, then upload ----
@@ -1482,6 +1601,7 @@ int main(int argc, char** argv) {
     long solutions = 0;
     long long stat_cands[6] = {0}, stat_exact[6] = {0}, stat_false[6] = {0};
     u64 stat_probes[6] = {0}, stat_calls[6] = {0}, stat_gated[6] = {0};
+    u64 stat_tri_skip[6] = {0}, stat_tri_tot[6] = {0};
     double stat_ms[6] = {0};
     std::set<std::array<long long, 6>> reported;
 
@@ -1511,6 +1631,8 @@ int main(int argc, char** argv) {
             stat_probes[cls] += R.probes;
             stat_calls[cls] += R.calls;
             stat_gated[cls] += R.gated;
+            stat_tri_skip[cls] += R.tri_skipped;
+            stat_tri_tot[cls] += R.tri_total;
             stat_ms[cls] += R.kernel_ms;
             if (R.overflow)
                 fprintf(stderr, "!! hit buffer overflow at B<=%lld — rerun with larger --hit-cap\n", c1);
@@ -1532,11 +1654,17 @@ int main(int argc, char** argv) {
 
     fprintf(stderr, "---- summary ----\n");
     for (int cls : classes)
-        if (stat_cands[cls])
-            fprintf(stderr, "cls%d: cands=%lld probes=%.4e kernel=%.1fs rate=%.2e probes/s exact=%lld fp-false=%lld gate-kill=%.2f%%\n",
+        if (stat_cands[cls]) {
+            fprintf(stderr, "cls%d: cands=%lld probes=%.4e kernel=%.1fs rate=%.2e probes/s exact=%lld fp-false=%lld gate-kill=%.2f%%",
                     cls, stat_cands[cls], (double)stat_probes[cls], stat_ms[cls] / 1e3,
                     stat_probes[cls] / std::max(1e-9, stat_ms[cls] / 1e3), stat_exact[cls], stat_false[cls],
                     100.0 * (double)stat_gated[cls] / std::max(1.0, (double)(stat_gated[cls] + stat_calls[cls])));
+            if (stat_tri_tot[cls])
+                fprintf(stderr, " tri-skip=%.2f%% (%llu/%llu blocks)",
+                        100.0 * (double)stat_tri_skip[cls] / (double)stat_tri_tot[cls],
+                        (unsigned long long)stat_tri_skip[cls], (unsigned long long)stat_tri_tot[cls]);
+            fprintf(stderr, "\n");
+        }
     fprintf(stderr, "total solutions: %ld\n", solutions);
     return 0;
 }

@@ -32,6 +32,28 @@ Expectation value from the heuristic density (κ-law) for this range is
 ~1.6 × 10⁻⁴ solutions, so 0 is the statistically expected outcome; the
 deliverable is the exclusion record.
 
+## (6,1,6) — six terms, one side
+
+Parallel search for
+
+```
+a₁⁶ + a₂⁶ + a₃⁶ + a₄⁶ + a₅⁶ + a₆⁶ = B⁶
+```
+
+using `solve_616_v1.cu` (same table/gate machinery as above, five Meyrignac
+classes for six terms). EulerNet covered **B ≤ 110,266** (Jan 2000); new ground
+starts at 110,267.
+
+| Item | Value |
+|---|---|
+| Range cleared (this project) | B ∈ [110,267, **530,000**] |
+| Result so far | **0 solutions** |
+| Status | **Search ongoing** |
+
+Build: `make v616`. Run: `./solve_616_v1 110267 530001 all` (see
+`solve_616_v1.cu` header for options). cls5 uses a triple-sum window gate
+(`--no-tri-gate` for A/B); see `cpuplan.md` for planned CPU/cache optimizations.
+
 ## The seven tricks that make it fast
 
 ### 1. Only primitive B — and B must be coprime to 42
@@ -155,7 +177,7 @@ Sound by construction — real pair sums always pass. The same gate ships in
 2. **Beyond 2¹²⁷:** CRT over 2–3 64-bit primes (or 192-bit limbs) lifts the
    B ceiling past 2.35M; with trick 1 the next milestone is B = 10⁷.
 3. **Ports of the same engine** (k=6 machinery is class-generic):
-   **(6,1,6)** — `solve_616_v1.cu` (EulerNet bound B ≤ 110,266; new ground from 110,267);
+   **(6,1,6)** — `solve_616_v1.cu` (in progress; see section above);
    **(6,2,4)** — sum of four sixth powers = sum of two — is *open* and has
    exactly this MITM shape (targets become pair sums instead of B⁶−u⁶).
 4. **Near-miss logging:** threshold the residual stream to tabulate record

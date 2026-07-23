@@ -28,9 +28,7 @@ conjecture (k = m + n) would need k > 6 terms to fail [^1^].
 | Fingerprint false positives | 2,264 — all rejected by exact CPU verification, 0 missed |
 | Hardware | NVIDIA RTX PRO 6000 Blackwell (188 SMs, 102 GB), 24 CPU threads |
 
-Expectation value from the heuristic density (κ-law) for this range is
-~1.6 × 10⁻⁴ solutions, so 0 is the statistically expected outcome; the
-deliverable is the exclusion record.
+
 
 ## (6,1,6) — six terms, one side
 
@@ -46,7 +44,7 @@ starts at 110,267.
 
 | Item | Value |
 |---|---|
-| Range cleared (this project) | B ∈ [110,267, **530,000**] |
+| Range cleared (this project) | B ∈ [110,267, **950,000**] |
 | Result so far | **0 solutions** |
 | Status | **Search ongoing** |
 

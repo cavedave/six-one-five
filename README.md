@@ -1,4 +1,32 @@
-# six-one-five: a GPU search for a₁⁶+a₂⁶+a₃⁶+a₄⁶+a₅⁶ = B⁶
+# six-one-five: GPU searches for equal sums of sixth powers
+
+## New (6,1,7) primitives found by this project
+
+Three new primitive solutions of \(a_1^6+\cdots+a_7^6=B^6\) (2nd kind: \(7\nmid B\)),
+found with `solve_617_v1` Branch A. None appear in the prior EulerNet clean list
+(`617-solutions-clean.txt`, max was \(B=410455\)).
+
+### 1. \(B = 400471\) (cls5, 2nd kind)
+
+\[
+13860^6 + 83202^6 + 93240^6 + 129696^6 + 144756^6 + 355502^6 + 357609^6 = 400471^6
+\]
+
+### 2. \(B = 421663\) (cls5, 2nd kind)
+
+\[
+85407^6 + 112560^6 + 231294^6 + 258888^6 + 296394^6 + 306102^6 + 392630^6 = 421663^6
+\]
+
+### 3. \(B = 423601\) (cls4, 2nd kind)
+
+\[
+6720^6 + 8610^6 + 11473^6 + 36834^6 + 98994^6 + 344778^6 + 400014^6 = 423601^6
+\]
+
+---
+
+## (6,1,5) — five terms = one sixth power
 
 A CUDA meet-in-the-middle solver for the Diophantine equation
 
@@ -51,6 +79,39 @@ starts at 110,267.
 Build: `make v616`. Run: `./solve_616_v1 110267 530001 all` (see
 `solve_616_v1.cu` header for options). cls5 uses a triple-sum window gate
 (`--no-tri-gate` for A/B); see `cpuplan.md` for planned CPU/cache optimizations.
+
+## (6,1,7) — seven terms, one side
+
+Search for
+
+```
+a₁⁶ + a₂⁶ + a₃⁶ + a₄⁶ + a₅⁶ + a₆⁶ + a₇⁶ = B⁶
+```
+
+with `solve_617_v1.cu` (sibling of the 616 solver):
+
+- **Branch A** (\(7\nmid B\)): GPU Meyrignac classes 1–5 (42-scaled seeds + find4/find5)
+- **Branch B** (\(7\mid B\)): separate path (CPU MITM / limited GPU); not used in the
+  overnight strips below
+
+| Item | Value |
+|---|---|
+| Known list (EulerNet clean) | 178 solutions, \(B \le 410455\) |
+| **New primitives (this project)** | **400471**, **421663**, **423601** (all 2nd kind) |
+| Branch A strip cleared | \(B \in [420257,\ 425000]\) (plus earlier 400k band) |
+| Solver | `make v617` → `./solve_617_v1` |
+
+Typical overnight Branch A launch (use `--chunk 64` near 400k+ to bound host RAM):
+
+```bash
+stdbuf -oL -eL nohup ./solve_617_v1 420257 425000 all --branch-a-only \
+  --chunk 64 \
+  > runs/617_a_420k_425k.log 2>&1 &
+```
+
+Validate with `--selftest` and `--check-known --known-file 617-solutions-clean.txt`.
+See `solve_617_v1.cu` header and `617plan.md`. Record-style hunt near \(B\sim 22\text{M}\)
+is a separate tool path (`record_hunt` / `record_find5`).
 
 ## The seven tricks that make it fast
 
@@ -149,7 +210,7 @@ to order of magnitude — the lookup layer behaves as modeled.
   support, so the binary targets `compute_90` PTX and the driver JIT-compiles
   it on first launch (small one-time pause; slightly pessimistic codegen).
   With CUDA ≥ 12.8, build natively for sm_120 instead.
-* **Build:** `make v3` (or `make v616` for the (6,1,6) port). See `Makefile`.
+* **Build:** `make v3` (or `make v616` / `make v617`). See `Makefile`.
 * **Validate then run:**
   ```
   ./solve_516_v3 --selftest
@@ -176,6 +237,7 @@ Sound by construction — real pair sums always pass. The same gate ships in
    B ceiling past 2.35M; with trick 1 the next milestone is B = 10⁷.
 3. **Ports of the same engine** (k=6 machinery is class-generic):
    **(6,1,6)** — `solve_616_v1.cu` (in progress; see section above);
+   **(6,1,7)** — `solve_617_v1.cu` (Branch A producing new primitives; see above);
    **(6,2,4)** — sum of four sixth powers = sum of two — is *open* and has
    exactly this MITM shape (targets become pair sums instead of B⁶−u⁶).
 4. **Near-miss logging:** threshold the residual stream to tabulate record

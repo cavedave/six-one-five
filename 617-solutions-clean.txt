@@ -1,6 +1,6 @@
-# 181 known solutions of x1^6+...+x7^6 = z^6 (primitive, z < 424000)
+# 185 known solutions of x1^6+...+x7^6 = z^6 (primitive, z < 428000)
 # reconstructed from http://euler.free.fr/database.txt (the uploaded database.txt was corrupt)
-# plus three new 2nd-kind primitives from this project's solve_617_v1 Branch A (07/2026)
+# plus seven new 2nd-kind primitives from this project's solve_617_v1 Branch A (07/2026)
 # format: z = x1 + x2 + ... + x7  | kind | discoverer
 1141 = 1077 + 894 + 702 + 474 + 402 + 234 + 74  | 1st kind (7|z) | Lander, Parkin and Selfridge,1966
 1645 = 1560 + 1299 + 864 + 702 + 618 + 430 + 150  | 1st kind (7|z) | Jean-Charles Meyrignac, 1999
@@ -183,3 +183,7 @@
 410455 = 343574 + 315798 + 307902 + 271740 + 260826 + 259812 + 253911  | 2nd kind | Rolan Christofferson, 01/18/2010
 421663 = 392630 + 306102 + 296394 + 258888 + 231294 + 112560 + 85407  | 2nd kind | this project (solve_617_v1), 07/2026
 423601 = 400014 + 344778 + 98994 + 36834 + 11473 + 8610 + 6720  | 2nd kind | this project (solve_617_v1), 07/2026
+425003 = 369348 + 352800 + 282702 + 279454 + 260526 + 224130 + 38997  | 2nd kind | this project (solve_617_v1), 07/2026
+425155 = 384894 + 324198 + 317506 + 278208 + 130914 + 84000 + 32067  | 2nd kind | this project (solve_617_v1), 07/2026
+425729 = 385014 + 355551 + 293106 + 184338 + 119658 + 53466 + 8512  | 2nd kind | this project (solve_617_v1), 07/2026
+427027 = 397992 + 352884 + 201540 + 189378 + 188685 + 66276 + 62132  | 2nd kind | this project (solve_617_v1), 07/2026

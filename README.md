@@ -2,27 +2,21 @@
 
 ## New (6,1,7) primitives found by this project
 
-Three new primitive solutions of \(a_1^6+\cdots+a_7^6=B^6\) (2nd kind: \(7\nmid B\)),
+Seven new primitive solutions of \(a_1^6+\cdots+a_7^6=B^6\) (2nd kind: \(7\nmid B\)),
 found with `solve_617_v1` Branch A. None appear in the prior EulerNet clean list
-(`617-solutions-clean.txt`, max was \(B=410455\)).
+(previous max there was \(B=410455\)).
 
-### 1. \(B = 400471\) (cls5, 2nd kind)
+| \(B\) | Class | Identity (sorted terms) |
+|---:|:---:|---|
+| **400471** | cls5 | \(13860^6 + 83202^6 + 93240^6 + 129696^6 + 144756^6 + 355502^6 + 357609^6\) |
+| **421663** | cls5 | \(85407^6 + 112560^6 + 231294^6 + 258888^6 + 296394^6 + 306102^6 + 392630^6\) |
+| **423601** | cls4 | \(6720^6 + 8610^6 + 11473^6 + 36834^6 + 98994^6 + 344778^6 + 400014^6\) |
+| **425003** | cls5 | \(38997^6 + 224130^6 + 260526^6 + 279454^6 + 282702^6 + 352800^6 + 369348^6\) |
+| **425155** | cls5 | \(32067^6 + 84000^6 + 130914^6 + 278208^6 + 317506^6 + 324198^6 + 384894^6\) |
+| **425729** | cls5 | \(8512^6 + 53466^6 + 119658^6 + 184338^6 + 293106^6 + 355551^6 + 385014^6\) |
+| **427027** | cls5 | \(62132^6 + 66276^6 + 188685^6 + 189378^6 + 201540^6 + 352884^6 + 397992^6\) |
 
-\[
-13860^6 + 83202^6 + 93240^6 + 129696^6 + 144756^6 + 355502^6 + 357609^6 = 400471^6
-\]
-
-### 2. \(B = 421663\) (cls5, 2nd kind)
-
-\[
-85407^6 + 112560^6 + 231294^6 + 258888^6 + 296394^6 + 306102^6 + 392630^6 = 421663^6
-\]
-
-### 3. \(B = 423601\) (cls4, 2nd kind)
-
-\[
-6720^6 + 8610^6 + 11473^6 + 36834^6 + 98994^6 + 344778^6 + 400014^6 = 423601^6
-\]
+Each row satisfies \(\sum a_i^6 = B^6\) with \(\gcd(a_1,\ldots,a_7,B)=1\).
 
 ---
 
@@ -96,17 +90,17 @@ with `solve_617_v1.cu` (sibling of the 616 solver):
 
 | Item | Value |
 |---|---|
-| Known list (EulerNet clean) | 178 solutions, \(B \le 410455\) |
-| **New primitives (this project)** | **400471**, **421663**, **423601** (all 2nd kind) |
-| Branch A strip cleared | \(B \in [420257,\ 425000]\) (plus earlier 400k band) |
+| Known list (EulerNet clean, prior) | 178 solutions, \(B \le 410455\) |
+| **New primitives (this project)** | **7** — see table at top (all 2nd kind) |
+| Branch A strip cleared | through \(B \approx 430000\) (from ~400k) |
 | Solver | `make v617` → `./solve_617_v1` |
 
 Typical overnight Branch A launch (use `--chunk 64` near 400k+ to bound host RAM):
 
 ```bash
-stdbuf -oL -eL nohup ./solve_617_v1 420257 425000 all --branch-a-only \
+stdbuf -oL -eL nohup ./solve_617_v1 425001 430000 all --branch-a-only \
   --chunk 64 \
-  > runs/617_a_420k_425k.log 2>&1 &
+  > runs/617_a_425k_430k.log 2>&1 &
 ```
 
 Validate with `--selftest` and `--check-known --known-file 617-solutions-clean.txt`.

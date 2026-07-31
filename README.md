@@ -2,7 +2,7 @@
 
 ## New (6,1,7) primitives found by this project
 
-Seven new primitive solutions of \(a_1^6+\cdots+a_7^6=B^6\) (2nd kind: \(7\nmid B\)),
+Nine new primitive solutions of \(a_1^6+\cdots+a_7^6=B^6\) (2nd kind: \(7\nmid B\)),
 found with `solve_617_v1` Branch A. None appear in the prior EulerNet clean list
 (previous max there was \(B=410455\)).
 
@@ -15,6 +15,8 @@ found with `solve_617_v1` Branch A. None appear in the prior EulerNet clean list
 | **425155** | cls5 | \(32067^6 + 84000^6 + 130914^6 + 278208^6 + 317506^6 + 324198^6 + 384894^6\) |
 | **425729** | cls5 | \(8512^6 + 53466^6 + 119658^6 + 184338^6 + 293106^6 + 355551^6 + 385014^6\) |
 | **427027** | cls5 | \(62132^6 + 66276^6 + 188685^6 + 189378^6 + 201540^6 + 352884^6 + 397992^6\) |
+| **428195** | cls3 | \(128226^6 + 129213^6 + 169828^6 + 246792^6 + 290052^6 + 340158^6 + 394338^6\) |
+| **428329** | cls5 | \(51450^6 + 156681^6 + 161100^6 + 257964^6 + 275478^6 + 342384^6 + 395038^6\) |
 
 Each row satisfies \(\sum a_i^6 = B^6\) with \(\gcd(a_1,\ldots,a_7,B)=1\).
 

@@ -1,0 +1,883 @@
+// =============================================================================
+// fourcore_find_v3.cu — GPU find4/find3/find2 for multi-class post-i128 (6,1,5)
+//
+// Consumes:
+//   --units FILE.buc   lines: cls B u          (expand free terms on host via GMP)
+//   --jobs  FILE.but   lines: cls B u f1 f2 T_lo T_hi
+//
+// Kernels (T already /42^6):
+//   cls1 → find4  (T = c1^6+c2^6+c3^6+c4^6)
+//   cls2/3/4 → find3  (T = c1^6+c2^6+c3^6; free1=d already peeled)
+//   cls5 → find2  (T = c1^6+c2^6; free1=d, free2=e peeled)
+//
+// Build:
+//   make fourcore-find-v3
+// Host-only smoke:
+//   make fourcore-find-v3-host && ./fourcore_find_v3_host --selftest-host
+// =============================================================================
+
+#include "fourcore_classes_v3.hpp"
+#include "fourcore_gmp.hpp"
+
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <numeric>
+#include <string>
+#include <vector>
+
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
+#ifndef HOST_ONLY
+#include <cuda_runtime.h>
+#define CU(x) do { cudaError_t _e=(x); if((_e)!=cudaSuccess){ \
+  fprintf(stderr,"CUDA %s:%d %s\n", __FILE__, __LINE__, cudaGetErrorString(_e)); \
+  exit(1); } } while(0)
+#endif
+
+using Clock = std::chrono::steady_clock;
+using u16 = std::uint16_t;
+
+// ------------------------------ gate ---------------------------------------
+struct GateData {
+  u64 g504[8] = {0};
+  u64 g247[4] = {0};
+  u16 p6504[504];
+  u16 p6247[247];
+};
+static inline void gate_set(u64* b, int x) { b[x >> 6] |= 1ULL << (x & 63); }
+static inline bool gate_get(const u64* b, int x) {
+  return (b[x >> 6] >> (x & 63)) & 1ULL;
+}
+static inline u32 mod_pow6_h(u32 x, u32 m) {
+  u64 a = x;
+  u64 x2 = (a * a) % m;
+  u64 x4 = (x2 * x2) % m;
+  return (u32)((x2 * x4) % m);
+}
+static void build_gate(GateData& g) {
+  for (int i = 0; i < 504; ++i) {
+    const int si = (int)mod_pow6_h((u32)i, 504);
+    g.p6504[i] = (u16)si;
+    for (int j = i; j < 504; ++j)
+      gate_set(g.g504, (si + (int)mod_pow6_h((u32)j, 504)) % 504);
+  }
+  for (int i = 0; i < 247; ++i) {
+    const int si = (int)mod_pow6_h((u32)i, 247);
+    g.p6247[i] = (u16)si;
+    for (int j = i; j < 247; ++j)
+      gate_set(g.g247, (si + (int)mod_pow6_h((u32)j, 247)) % 247);
+  }
+}
+static bool gate_selftest_host(const GateData& g) {
+  int c504 = 0, c247 = 0;
+  for (int x = 0; x < 504; ++x) c504 += (int)gate_get(g.g504, x);
+  for (int x = 0; x < 247; ++x) c247 += (int)gate_get(g.g247, x);
+  if (c504 != 27 || c247 != 50) {
+    fprintf(stderr, "gate sizes %d/%d want 27/50\n", c504, c247);
+    return false;
+  }
+  printf("[gate] bitmaps 27/504 and 50/247 OK\n");
+  return true;
+}
+
+// ------------------------------ jobs / table -------------------------------
+struct Job {
+  int cls = 0;
+  u64 B = 0, u = 0;
+  u64 free1 = 0, free2 = 0;  // d ; e (cls5)
+  u128 T = 0;
+  u32 lim = 0;
+};
+
+struct Slot { u32 i = 0, j = 0; u64 key = 0; };
+
+// Hit: a,b pair; c = c3 (find3/4) or 0 (find2); d = c4 (find4) or 0
+struct Hit { u32 job, a, b, c, d; };
+
+struct Cand {
+  u64 q_lo, q_hi;
+  u32 lim;
+  u32 lo, hi;       // find3/4 window; unused for find2
+  u32 job;
+  u32 T_r504, T_r247;
+  u32 pad;
+};
+
+static inline u128 pow6_full(u64 x) {
+  u128 a = (u128)x * (u128)x;
+  return a * a * a;
+}
+static inline u64 mix64_h(u64 x) {
+  x ^= x >> 33; x *= 0xff51afd7ed558ccdULL;
+  x ^= x >> 33; x *= 0xc4ceb9fe1a85ec53ULL;
+  x ^= x >> 33; return x;
+}
+static inline u64 hash_pos(u64 fp, int S) {
+  return (fp * 0x9E3779B97F4A7C15ULL) >> (64 - S);
+}
+static u32 iroot6_host(u128 n) {
+  double x = ldexp((double)(u64)(n >> 64), 64) + (double)(u64)n;
+  if (x < 1.0) return 0;
+  double r = pow(x, 1.0 / 6.0);
+  u64 a = (u64)r;
+  while ((pow6_full(a + 1) <= n) && a < 0xffffffffULL - 2) ++a;
+  while (pow6_full(a) > n && a) --a;
+  return (u32)a;
+}
+
+static int choose_S(double max_table_gb) {
+  const long double bytes = (long double)max_table_gb * 1e9L;
+  int S = 24;
+  while (S + 1 <= 34 && ((long double)(1ULL << (S + 1)) * 16.0L) <= bytes) ++S;
+  return S;
+}
+
+static void table_build(int N, int S, std::vector<Slot>& slots) {
+  const size_t size = (size_t)1 << S;
+  const u64 mask = size - 1;
+  const double pairs_est = (double)N * (N + 1) / 2.0;
+  if (pairs_est > (double)size) {
+    fprintf(stderr, "[fatal] pairs=%.3e > slots=2^%d — raise S / max-table-gb or lower N\n",
+            pairs_est, S);
+    exit(1);
+  }
+  slots.assign(size, Slot{});
+  std::vector<u64> pw6(N + 1);
+  for (int x = 1; x <= N; ++x) pw6[x] = (u64)pow6_full((u64)x);
+  std::atomic<u64> used(0);
+  auto t0 = Clock::now();
+#pragma omp parallel for schedule(dynamic, 256)
+  for (int i = 1; i <= N; ++i) {
+    for (int j = 1; j <= i; ++j) {
+      const u64 fp = pw6[i] + pw6[j];
+      u64 pos = hash_pos(fp, S);
+      const u64 step = mix64_h(fp) | 1ULL;
+      for (;;) {
+        if (__sync_bool_compare_and_swap((u32*)&slots[pos].i, 0u, (u32)i)) {
+          slots[pos].j = (u32)j;
+          slots[pos].key = fp;
+          used.fetch_add(1, std::memory_order_relaxed);
+          break;
+        }
+        pos = (pos + step) & mask;
+      }
+    }
+  }
+  const double ms = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - t0).count();
+  fprintf(stderr, "[table] N=%d pairs=%.3e S=%d (%.1f GB) LF=%.3f build=%.0f ms\n",
+          N, pairs_est, S, size * 16.0 / 1e9, used.load() / (double)size, ms);
+}
+
+static bool load_jobs_but(const char* path, std::vector<Job>& jobs) {
+  FILE* f = fopen(path, "r");
+  if (!f) return false;
+  char buf[256];
+  size_t bad = 0;
+  while (fgets(buf, sizeof buf, f)) {
+    int cls;
+    unsigned long long B, u, f1, f2, tlo, thi;
+    if (sscanf(buf, "%d %llu %llu %llu %llu %llu %llu",
+               &cls, &B, &u, &f1, &f2, &tlo, &thi) != 7) {
+      ++bad; continue;
+    }
+    Job J;
+    J.cls = cls; J.B = B; J.u = u; J.free1 = f1; J.free2 = f2;
+    J.T = join_u128(tlo, thi);
+    J.lim = (u32)((B - 1) / 42);
+    jobs.push_back(J);
+  }
+  fclose(f);
+  if (bad) fprintf(stderr, "[jobs] skipped %zu bad lines\n", bad);
+  return !jobs.empty();
+}
+
+static bool load_units_buc(const char* path, std::vector<Job>& units) {
+  FILE* f = fopen(path, "r");
+  if (!f) return false;
+  char buf[256];
+  while (fgets(buf, sizeof buf, f)) {
+    int cls;
+    unsigned long long B, u;
+    if (sscanf(buf, "%d %llu %llu", &cls, &B, &u) != 3) continue;
+    Job J;
+    J.cls = cls; J.B = B; J.u = u; J.lim = (u32)((B - 1) / 42);
+    units.push_back(J);
+  }
+  fclose(f);
+  return !units.empty();
+}
+
+// Expand one Stage-1 unit into reduced-T jobs (may be huge for cls5).
+static void expand_unit(const fc3::RootTables& rt, const Job& U,
+                        std::vector<Job>& out, u64& failT,
+                        u64 max_out, bool& hit_cap) {
+  if (hit_cap) return;
+  auto push = [&](Job J) {
+    if (max_out && out.size() >= (size_t)max_out) { hit_cap = true; return; }
+    out.push_back(J);
+  };
+  if (U.cls == 1) {
+    u128 T = 0;
+    if (!compute_T_gmp(U.B, U.u, 42, T)) { ++failT; return; }
+    Job J = U; J.free1 = J.free2 = 0; J.T = T; push(J);
+    return;
+  }
+  if (U.cls >= 2 && U.cls <= 4) {
+    const int f = fc3::free_factor(U.cls);
+    auto fs = fc3::free_d_cls234(rt, (long long)U.B, (long long)U.u, U.cls);
+    fc3::for_each_free(fs, [&](long long d) {
+      if (hit_cap) return;
+      u128 T = 0;
+      if (!compute_T_peel1_gmp(U.B, U.u, (u64)f, (u64)d, T)) { ++failT; return; }
+      if (T == 0) return;
+      Job J = U; J.free1 = (u64)d; J.free2 = 0; J.T = T; push(J);
+    });
+    return;
+  }
+  if (U.cls == 5) {
+    fc3::FreeTermSpec es, ds;
+    fc3::free_de_cls5(rt, (long long)U.B, (long long)U.u, es, ds);
+    fc3::for_each_free(es, [&](long long e) {
+      if (hit_cap) return;
+      fc3::for_each_free(ds, [&](long long d) {
+        if (hit_cap) return;
+        u128 T = 0;
+        if (!compute_T_peel2_gmp(U.B, U.u, (u64)d, (u64)e, T)) { ++failT; return; }
+        if (T == 0) return;
+        Job J = U; J.free1 = (u64)d; J.free2 = (u64)e; J.T = T; push(J);
+      });
+    });
+  }
+}
+
+#ifndef HOST_ONLY
+// ------------------------------ device -------------------------------------
+__device__ __forceinline__ u64 d_mix64(u64 x) {
+  x ^= x >> 33; x *= 0xff51afd7ed558ccdULL;
+  x ^= x >> 33; x *= 0xc4ceb9fe1a85ec53ULL;
+  x ^= x >> 33; return x;
+}
+__device__ __forceinline__ u64 d_pow6_64(u32 x) {
+  u64 x2 = (u64)x * x;
+  return x2 * x2 * x2;
+}
+__device__ __forceinline__ void d_pow6_128(u32 x, u64& h, u64& l) {
+  u128 x2w = (u128)x * x;
+  u128 x6 = (x2w * x2w) * x2w;
+  l = (u64)x6; h = (u64)(x6 >> 64);
+}
+__device__ __forceinline__ u32 d_iroot6(u64 rhi, u64 rlo) {
+  double x = ldexp((double)rhi, 64) + (double)rlo;
+  if (x < 1.0) return 0;
+  double r = pow(x, 1.0 / 6.0);
+  if (r > 4294967294.0) return 0xffffffffu;
+  u32 a = (u32)r;
+  while (a < 0xfffffffeu) {
+    u64 h, l; d_pow6_128(a + 1, h, l);
+    if (h < rhi || (h == rhi && l <= rlo)) ++a; else break;
+  }
+  while (a > 0) {
+    u64 h, l; d_pow6_128(a, h, l);
+    if (h < rhi || (h == rhi && l <= rlo)) break;
+    --a;
+  }
+  return a;
+}
+
+__device__ int d_probe(const Slot* tab, u64 mask, int S, u64 fp,
+                       u32 c_ctx, u32 d_ctx, u32 job,
+                       Hit* hits, u32* nhit, u32 hit_cap) {
+  u64 pos = (fp * 0x9E3779B97F4A7C15ULL) >> (64 - S);
+  const u64 step = d_mix64(fp) | 1ULL;
+  for (int k = 0; k < 128; ++k) {
+    const Slot s = tab[pos];
+    if (s.i == 0) return 0;
+    if (s.key == fp && s.j <= c_ctx && s.i >= 1) {
+      u32 h = atomicAdd(nhit, 1u);
+      if (h < hit_cap) hits[h] = Hit{job, s.i, s.j, c_ctx, d_ctx};
+      return 1;
+    }
+    pos = (pos + step) & mask;
+  }
+  return 0;
+}
+
+struct GateSh { u64 g504[8]; u64 g247[4]; u16 p6504[504]; u16 p6247[247]; };
+__device__ __forceinline__ bool d_gate_bit(const u64* b, int x) {
+  return (b[x >> 6] >> (x & 63)) & 1ULL;
+}
+__device__ __forceinline__ void gate_load_sh(GateSh& gs, const GateData* gd) {
+  const int tid = threadIdx.x;
+  for (int k = tid; k < 8; k += blockDim.x) gs.g504[k] = gd->g504[k];
+  for (int k = tid; k < 4; k += blockDim.x) gs.g247[k] = gd->g247[k];
+  for (int k = tid; k < 504; k += blockDim.x) gs.p6504[k] = gd->p6504[k];
+  for (int k = tid; k < 247; k += blockDim.x) gs.p6247[k] = gd->p6247[k];
+  __syncthreads();
+}
+
+// find2: one block per cand; thread 0 probes (or all race — single probe).
+__global__ void k_find2(const Cand* __restrict__ cands, int nc,
+                        const Slot* __restrict__ tab, u64 mask, int S,
+                        const GateData* __restrict__ gd, int use_gate,
+                        Hit* __restrict__ hits, u32* __restrict__ nhit, u32 hit_cap,
+                        u64* __restrict__ out_calls, u64* __restrict__ out_gated,
+                        u64* __restrict__ out_probes) {
+  const int ci = blockIdx.x;
+  if (ci >= nc) return;
+  if (threadIdx.x != 0) return;
+  const Cand C = cands[ci];
+  atomicAdd((unsigned long long*)out_calls, 1ull);
+  if (use_gate) {
+    // target residue must be a pair-sum residue
+    if (!(d_gate_bit(gd->g504, (int)C.T_r504) && d_gate_bit(gd->g247, (int)C.T_r247))) {
+      atomicAdd((unsigned long long*)out_gated, 1ull);
+      return;
+    }
+  }
+  atomicAdd((unsigned long long*)out_probes, 1ull);
+  d_probe(tab, mask, S, C.q_lo, C.lim, 0, C.job, hits, nhit, hit_cap);
+}
+
+// find3: block per cand; threads stride c3 in [lo,hi]
+__global__ void k_find3(const Cand* __restrict__ cands, int nc,
+                        const Slot* __restrict__ tab, u64 mask, int S,
+                        const GateData* __restrict__ gd, int use_gate,
+                        Hit* __restrict__ hits, u32* __restrict__ nhit, u32 hit_cap,
+                        u64* __restrict__ out_calls, u64* __restrict__ out_gated,
+                        u64* __restrict__ out_probes) {
+  const u32 ci = blockIdx.x;
+  if ((int)ci >= nc) return;
+  const Cand C = cands[ci];
+  __shared__ GateSh gs;
+  if (use_gate) gate_load_sh(gs, gd);
+  u64 lcalls = 0, lgated = 0, lprobes = 0;
+  for (u32 c3 = C.lo + threadIdx.x; c3 <= C.hi; c3 += blockDim.x) {
+    ++lcalls;
+    if (use_gate) {
+      u32 r504 = C.T_r504 + 504u - gs.p6504[c3 % 504];
+      if (r504 >= 504u) r504 -= 504u;
+      u32 r247 = C.T_r247 + 247u - gs.p6247[c3 % 247];
+      if (r247 >= 247u) r247 -= 247u;
+      if (!(d_gate_bit(gs.g504, (int)r504) && d_gate_bit(gs.g247, (int)r247))) {
+        ++lgated; continue;
+      }
+    }
+    ++lprobes;
+    d_probe(tab, mask, S, C.q_lo - d_pow6_64(c3), c3, 0, C.job, hits, nhit, hit_cap);
+  }
+  atomicAdd((unsigned long long*)out_calls, (unsigned long long)lcalls);
+  atomicAdd((unsigned long long*)out_gated, (unsigned long long)lgated);
+  atomicAdd((unsigned long long*)out_probes, (unsigned long long)lprobes);
+}
+
+// find4: same structure as fourcore_find4_v2
+__global__ void k_find4(const Cand* __restrict__ cands, int nc,
+                        const Slot* __restrict__ tab, u64 mask, int S,
+                        const GateData* __restrict__ gd, int use_gate,
+                        Hit* __restrict__ hits, u32* __restrict__ nhit, u32 hit_cap,
+                        u64* __restrict__ out_calls, u64* __restrict__ out_gated,
+                        u64* __restrict__ out_probes) {
+  const u32 ci = blockIdx.x;
+  if ((int)ci >= nc) return;
+  const Cand C = cands[ci];
+  __shared__ GateSh gs;
+  if (use_gate) gate_load_sh(gs, gd);
+  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  const u32 base = C.lo + blockIdx.y * 2048u + (u32)warp;
+  u64 lcalls = 0, lgated = 0, lprobes = 0;
+  for (u32 c4 = base; c4 <= C.hi; c4 += 8) {
+    if (c4 < 1 || c4 > C.lim) continue;
+    u64 c4h, c4l; d_pow6_128(c4, c4h, c4l);
+    const u64 rlo = C.q_lo - c4l;
+    const u64 rhi = C.q_hi - c4h - (C.q_lo < c4l ? 1ull : 0ull);
+    if ((rhi >> 63) || ((rhi | rlo) == 0)) continue;
+    u32 hi3 = d_iroot6(rhi, rlo);
+    const u32 capm = C.lim < c4 ? C.lim : c4;
+    if (hi3 > capm) hi3 = capm;
+    if (hi3 < 1) continue;
+    u32 lo3 = (u32)(hi3 * 0.8);
+    if (lo3 < 1) lo3 = 1;
+    if (lo3 > hi3) continue;
+    const u64 tfp = C.q_lo - d_pow6_64(c4);
+    u32 r4_504 = 0, r4_247 = 0;
+    if (use_gate) {
+      r4_504 = gs.p6504[c4 % 504];
+      r4_247 = gs.p6247[c4 % 247];
+    }
+    for (u32 c3 = lo3 + (u32)lane; c3 <= hi3; c3 += 32) {
+      ++lcalls;
+      if (use_gate) {
+        u32 r504 = C.T_r504 + 1008u - r4_504 - gs.p6504[c3 % 504];
+        while (r504 >= 504u) r504 -= 504u;
+        u32 r247 = C.T_r247 + 494u - r4_247 - gs.p6247[c3 % 247];
+        while (r247 >= 247u) r247 -= 247u;
+        if (!(d_gate_bit(gs.g504, (int)r504) && d_gate_bit(gs.g247, (int)r247))) {
+          ++lgated; continue;
+        }
+      }
+      ++lprobes;
+      d_probe(tab, mask, S, tfp - d_pow6_64(c3), c3, c4, C.job, hits, nhit, hit_cap);
+    }
+  }
+  atomicAdd((unsigned long long*)out_calls, (unsigned long long)lcalls);
+  atomicAdd((unsigned long long*)out_gated, (unsigned long long)lgated);
+  atomicAdd((unsigned long long*)out_probes, (unsigned long long)lprobes);
+}
+
+struct GpuState {
+  Slot* d_tab = nullptr;
+  GateData* d_gd = nullptr;
+  Hit* d_hits = nullptr;
+  u32* d_nh = nullptr;
+  u64* d_calls = nullptr;
+  u64* d_gated = nullptr;
+  u64* d_probes = nullptr;
+  Cand* d_cands = nullptr;
+  size_t cand_cap = 0;
+  u32 hit_cap = 1u << 20;
+  int S = 0;
+  size_t tab_slots = 0;
+  bool use_gate = true;
+};
+
+static void gpu_init(GpuState& g, const std::vector<Slot>& slots, int S, bool use_gate) {
+  g.S = S;
+  g.tab_slots = slots.size();
+  g.use_gate = use_gate;
+  CU(cudaMalloc(&g.d_tab, slots.size() * sizeof(Slot)));
+  CU(cudaMemcpy(g.d_tab, slots.data(), slots.size() * sizeof(Slot), cudaMemcpyHostToDevice));
+  GateData gd; build_gate(gd);
+  CU(cudaMalloc(&g.d_gd, sizeof(gd)));
+  CU(cudaMemcpy(g.d_gd, &gd, sizeof(gd), cudaMemcpyHostToDevice));
+  CU(cudaMalloc(&g.d_hits, g.hit_cap * sizeof(Hit)));
+  CU(cudaMalloc(&g.d_nh, sizeof(u32)));
+  CU(cudaMalloc(&g.d_calls, sizeof(u64)));
+  CU(cudaMalloc(&g.d_gated, sizeof(u64)));
+  CU(cudaMalloc(&g.d_probes, sizeof(u64)));
+}
+
+static void gpu_free(GpuState& g) {
+  if (g.d_tab) cudaFree(g.d_tab);
+  if (g.d_gd) cudaFree(g.d_gd);
+  if (g.d_hits) cudaFree(g.d_hits);
+  if (g.d_nh) cudaFree(g.d_nh);
+  if (g.d_calls) cudaFree(g.d_calls);
+  if (g.d_gated) cudaFree(g.d_gated);
+  if (g.d_probes) cudaFree(g.d_probes);
+  if (g.d_cands) cudaFree(g.d_cands);
+}
+
+static void ensure_cands(GpuState& g, size_t n) {
+  if (n <= g.cand_cap) return;
+  if (g.d_cands) CU(cudaFree(g.d_cands));
+  g.cand_cap = n + n / 4 + 64;
+  CU(cudaMalloc(&g.d_cands, g.cand_cap * sizeof(Cand)));
+}
+
+static Cand make_cand(const Job& J, u32 job_idx, int mode) {
+  Cand C{};
+  C.q_lo = (u64)J.T;
+  C.q_hi = (u64)(J.T >> 64);
+  C.lim = J.lim;
+  C.job = job_idx;
+  C.T_r504 = (u32)(J.T % 504);
+  C.T_r247 = (u32)(J.T % 247);
+  if (mode == 2) {
+    C.lo = C.hi = 0;
+  } else if (mode == 3) {
+    u32 hi = std::min(iroot6_host(J.T), J.lim);
+    u32 lo = 1;
+    while (lo <= hi && pow6_full(lo) * 3 < J.T) ++lo;
+    if (lo > hi) { C.lo = 1; C.hi = 0; }
+    else { C.lo = lo; C.hi = hi; }
+  } else {  // find4
+    u32 hi = std::min(iroot6_host(J.T), J.lim);
+    u64 lo = 1;
+    while (lo <= hi && pow6_full(lo) * 4 < J.T) ++lo;
+    if (lo > hi) { C.lo = 1; C.hi = 0; }
+    else { C.lo = (u32)lo; C.hi = hi; }
+  }
+  return C;
+}
+
+static void report_solution(const Job& J, u32 a, u32 b, u32 c, u32 d) {
+  long long terms[5];
+  int n = 0;
+  if (J.cls == 1) {
+    terms[0] = 42LL * a; terms[1] = 42LL * b; terms[2] = 42LL * c;
+    terms[3] = 42LL * d; terms[4] = (long long)J.u; n = 5;
+    if (!verify_fourcore_gmp(J.B, J.u, 42, a, b, c, d)) return;
+  } else if (J.cls >= 2 && J.cls <= 4) {
+    const int f = fc3::free_factor(J.cls);
+    terms[0] = 42LL * a; terms[1] = 42LL * b; terms[2] = 42LL * c;
+    terms[3] = (long long)f * (long long)J.free1; terms[4] = (long long)J.u; n = 5;
+    if (!verify_cls234_gmp(J.B, J.u, (u64)f, J.free1, a, b, c)) return;
+  } else if (J.cls == 5) {
+    terms[0] = 42LL * a; terms[1] = 42LL * b;
+    terms[2] = 21LL * (long long)J.free1; terms[3] = 14LL * (long long)J.free2;
+    terms[4] = (long long)J.u; n = 5;
+    if (!verify_cls5_gmp(J.B, J.u, J.free1, J.free2, a, b)) return;
+  } else return;
+  std::sort(terms, terms + n);
+  for (int i = 0; i < n - 1; ++i) if (terms[i] == terms[i + 1]) return;
+  if (terms[n - 1] >= (long long)J.B || terms[0] < 1) return;
+  long long g = terms[0];
+  for (int i = 1; i < n; ++i) g = std::gcd(g, terms[i]);
+  g = std::gcd(g, (long long)J.B);
+  printf("SOLUTION cls=%d B=%llu u=%llu a1=%lld a2=%lld a3=%lld a4=%lld a5=%lld gcd=%lld %s\n",
+         J.cls, (unsigned long long)J.B, (unsigned long long)J.u,
+         terms[0], terms[1], terms[2], terms[3], terms[4], g,
+         g == 1 ? "primitive" : "NON-PRIMITIVE");
+  fflush(stdout);
+  fprintf(stderr, "%llu\tSOLUTION\tcls=%d\n", (unsigned long long)J.B, J.cls);
+}
+
+// Run a homogeneous batch (same cls / same kernel). jobs[i] must match mode.
+static u64 run_batch(GpuState& g, const std::vector<Job>& jobs, int mode,
+                     std::vector<u128>* p6 /*nullable, size N+1*/) {
+  if (jobs.empty()) return 0;
+  std::vector<Cand> cands;
+  cands.reserve(jobs.size());
+  std::vector<u32> ytiles;
+  for (size_t i = 0; i < jobs.size(); ++i) {
+    Cand C = make_cand(jobs[i], (u32)i, mode);
+    if (mode != 2 && C.hi < C.lo) continue;
+    cands.push_back(C);
+    if (mode == 4) {
+      u32 span = C.hi - C.lo + 1;
+      u32 yt = (span + 2047) / 2048;
+      if (yt < 1) yt = 1;
+      ytiles.push_back(yt);
+    }
+  }
+  if (cands.empty()) return 0;
+
+  ensure_cands(g, cands.size());
+  CU(cudaMemcpy(g.d_cands, cands.data(), cands.size() * sizeof(Cand), cudaMemcpyHostToDevice));
+  CU(cudaMemset(g.d_nh, 0, sizeof(u32)));
+  CU(cudaMemset(g.d_calls, 0, sizeof(u64)));
+  CU(cudaMemset(g.d_gated, 0, sizeof(u64)));
+  CU(cudaMemset(g.d_probes, 0, sizeof(u64)));
+
+  const u64 mask = g.tab_slots - 1;
+  if (mode == 2) {
+    k_find2<<<(int)cands.size(), 32>>>(
+        g.d_cands, (int)cands.size(), g.d_tab, mask, g.S, g.d_gd, g.use_gate ? 1 : 0,
+        g.d_hits, g.d_nh, g.hit_cap, g.d_calls, g.d_gated, g.d_probes);
+  } else if (mode == 3) {
+    k_find3<<<(int)cands.size(), 256>>>(
+        g.d_cands, (int)cands.size(), g.d_tab, mask, g.S, g.d_gd, g.use_gate ? 1 : 0,
+        g.d_hits, g.d_nh, g.hit_cap, g.d_calls, g.d_gated, g.d_probes);
+  } else {
+    // one launch per cand with its ytiles (simple + correct)
+    for (size_t i = 0; i < cands.size(); ++i) {
+      CU(cudaMemcpy(g.d_cands, &cands[i], sizeof(Cand), cudaMemcpyHostToDevice));
+      // rewrite job index to i for hit mapping — already set
+      k_find4<<<dim3(1, ytiles[i]), 256>>>(
+          g.d_cands, 1, g.d_tab, mask, g.S, g.d_gd, g.use_gate ? 1 : 0,
+          g.d_hits, g.d_nh, g.hit_cap, g.d_calls, g.d_gated, g.d_probes);
+    }
+  }
+  CU(cudaDeviceSynchronize());
+
+  u32 nh = 0;
+  u64 calls = 0, gated = 0, probes = 0;
+  CU(cudaMemcpy(&nh, g.d_nh, sizeof(u32), cudaMemcpyDeviceToHost));
+  CU(cudaMemcpy(&calls, g.d_calls, sizeof(u64), cudaMemcpyDeviceToHost));
+  CU(cudaMemcpy(&gated, g.d_gated, sizeof(u64), cudaMemcpyDeviceToHost));
+  CU(cudaMemcpy(&probes, g.d_probes, sizeof(u64), cudaMemcpyDeviceToHost));
+  if (calls)
+    fprintf(stderr, "[gate] batch n=%zu mode=%d calls=%llu gated=%llu probes=%llu gate=%.1f%%\n",
+            cands.size(), mode, (unsigned long long)calls, (unsigned long long)gated,
+            (unsigned long long)probes, 100.0 * (double)gated / (double)calls);
+
+  if (nh > g.hit_cap) { fprintf(stderr, "!! hit overflow\n"); nh = g.hit_cap; }
+  std::vector<Hit> raw(nh);
+  if (nh) CU(cudaMemcpy(raw.data(), g.d_hits, nh * sizeof(Hit), cudaMemcpyDeviceToHost));
+
+  u64 sols = 0;
+  for (const Hit& H : raw) {
+    if (H.job >= jobs.size()) continue;
+    const Job& J = jobs[H.job];
+    // exact T check
+    if (mode == 2) {
+      if (!p6 || H.a > J.lim || H.b > J.lim) continue;
+      if ((*p6)[H.a] + (*p6)[H.b] != J.T) continue;
+      report_solution(J, H.a, H.b, 0, 0);
+      ++sols;
+    } else if (mode == 3) {
+      if (!p6 || H.c < 1) continue;
+      if ((*p6)[H.a] + (*p6)[H.b] + (*p6)[H.c] != J.T) continue;
+      if (!(H.a <= H.b && H.b <= H.c)) continue;
+      report_solution(J, H.a, H.b, H.c, 0);
+      ++sols;
+    } else {
+      if (!p6 || H.c < 1 || H.d < 1) continue;
+      if ((*p6)[H.a] + (*p6)[H.b] + (*p6)[H.c] + (*p6)[H.d] != J.T) continue;
+      if (!(H.a <= H.b && H.b <= H.c && H.c <= H.d)) continue;
+      report_solution(J, H.a, H.b, H.c, H.d);
+      ++sols;
+    }
+  }
+  return sols;
+}
+
+static int mode_for_cls(int cls) {
+  if (cls == 1) return 4;
+  if (cls >= 2 && cls <= 4) return 3;
+  if (cls == 5) return 2;
+  return 0;
+}
+
+static u64 process_jobs(GpuState& g, std::vector<Job>& jobs, int N,
+                        bool stop_first) {
+  std::vector<u128> p6(N + 1);
+  for (int x = 1; x <= N; ++x) p6[x] = pow6_full((u64)x);
+  // group by mode
+  u64 sols = 0;
+  for (int mode : {4, 3, 2}) {
+    std::vector<Job> batch;
+    for (const auto& J : jobs)
+      if (mode_for_cls(J.cls) == mode) batch.push_back(J);
+    if (batch.empty()) continue;
+    fprintf(stderr, "[run] mode=find%d jobs=%zu\n", mode, batch.size());
+    // chunk find2 heavily
+    const size_t CHUNK = (mode == 2) ? 4096 : (mode == 3) ? 256 : 32;
+    for (size_t off = 0; off < batch.size(); off += CHUNK) {
+      size_t n = std::min(CHUNK, batch.size() - off);
+      std::vector<Job> sub(batch.begin() + off, batch.begin() + off + n);
+      sols += run_batch(g, sub, mode, &p6);
+      if (stop_first && sols) return sols;
+      if ((off / CHUNK) % 20 == 0)
+        fprintf(stderr, "[progress] mode=%d %zu/%zu sols=%llu\n",
+                mode, off + n, batch.size(), (unsigned long long)sols);
+    }
+  }
+  return sols;
+}
+#endif // !HOST_ONLY
+
+// ------------------------------ selftests ----------------------------------
+static int selftest_host() {
+  printf("[selftest-host] gate + peel plants\n");
+  GateData gd; build_gate(gd);
+  if (!gate_selftest_host(gd)) return 1;
+  fc3::RootTables rt;
+  // find3 plant identity: T=3^6+4^6+5^6, peel reconstruct
+  u128 T = pow6_full(3) + pow6_full(4) + pow6_full(5);
+  u64 lo, hi; split_u128(T, lo, hi);
+  if (join_u128(lo, hi) != T) { printf("FAIL split\n"); return 1; }
+  // cls2 peel sample already in hunt_v3; re-check one
+  u128 Tp = 0;
+  if (!compute_T_peel1_gmp(100139, 73365, 14, 19, Tp)) {
+    printf("FAIL peel1 sample\n"); return 1;
+  }
+  printf("[selftest-host] PASS\n");
+  return 0;
+}
+
+#ifndef HOST_ONLY
+static int selftest_gpu() {
+  printf("[selftest-gpu] tiny table + planted find2/find3/find4\n");
+  const int N = 40;
+  int S = 20;
+  std::vector<Slot> slots;
+  table_build(N, S, slots);
+  GpuState g;
+  gpu_init(g, slots, S, true);
+
+  std::vector<Job> jobs;
+  // find2 plant
+  {
+    Job J; J.cls = 5; J.B = 999999; J.u = 1; J.free1 = 1; J.free2 = 1;
+    J.T = pow6_full(3) + pow6_full(4); J.lim = N;
+    jobs.push_back(J);
+  }
+  // find3 plant
+  {
+    Job J; J.cls = 2; J.B = 999998; J.u = 1; J.free1 = 1; J.free2 = 0;
+    J.T = pow6_full(3) + pow6_full(4) + pow6_full(5); J.lim = N;
+    jobs.push_back(J);
+  }
+  // find4 plant
+  {
+    Job J; J.cls = 1; J.B = 999997; J.u = 1; J.free1 = 0; J.free2 = 0;
+    J.T = pow6_full(3) + pow6_full(4) + pow6_full(5) + pow6_full(6); J.lim = N;
+    jobs.push_back(J);
+  }
+
+  // Don't use report_solution GMP verify against fake B — check T hits only.
+  std::vector<u128> p6(N + 1);
+  for (int x = 1; x <= N; ++x) p6[x] = pow6_full((u64)x);
+
+  u64 hits_exact = 0;
+  for (int mode : {2, 3, 4}) {
+    std::vector<Job> batch;
+    for (auto& J : jobs) if (mode_for_cls(J.cls) == mode) batch.push_back(J);
+    if (batch.empty()) continue;
+    // custom: count exact T matches without verify_615
+    ensure_cands(g, batch.size());
+    std::vector<Cand> cands;
+    for (size_t i = 0; i < batch.size(); ++i) cands.push_back(make_cand(batch[i], (u32)i, mode));
+    CU(cudaMemcpy(g.d_cands, cands.data(), cands.size() * sizeof(Cand), cudaMemcpyHostToDevice));
+    CU(cudaMemset(g.d_nh, 0, sizeof(u32)));
+    CU(cudaMemset(g.d_calls, 0, sizeof(u64)));
+    CU(cudaMemset(g.d_gated, 0, sizeof(u64)));
+    CU(cudaMemset(g.d_probes, 0, sizeof(u64)));
+    const u64 mask = g.tab_slots - 1;
+    if (mode == 2)
+      k_find2<<<(int)cands.size(), 32>>>(g.d_cands, (int)cands.size(), g.d_tab, mask, g.S,
+          g.d_gd, 1, g.d_hits, g.d_nh, g.hit_cap, g.d_calls, g.d_gated, g.d_probes);
+    else if (mode == 3)
+      k_find3<<<(int)cands.size(), 256>>>(g.d_cands, (int)cands.size(), g.d_tab, mask, g.S,
+          g.d_gd, 1, g.d_hits, g.d_nh, g.hit_cap, g.d_calls, g.d_gated, g.d_probes);
+    else {
+      Cand C = cands[0];
+      u32 span = C.hi - C.lo + 1;
+      u32 yt = (span + 2047) / 2048; if (!yt) yt = 1;
+      k_find4<<<dim3(1, yt), 256>>>(g.d_cands, 1, g.d_tab, mask, g.S,
+          g.d_gd, 1, g.d_hits, g.d_nh, g.hit_cap, g.d_calls, g.d_gated, g.d_probes);
+    }
+    CU(cudaDeviceSynchronize());
+    u32 nh = 0;
+    CU(cudaMemcpy(&nh, g.d_nh, sizeof(u32), cudaMemcpyDeviceToHost));
+    std::vector<Hit> raw(nh);
+    if (nh) CU(cudaMemcpy(raw.data(), g.d_hits, nh * sizeof(Hit), cudaMemcpyDeviceToHost));
+    u64 ok = 0;
+    for (auto& H : raw) {
+      if (H.job >= batch.size()) continue;
+      const Job& J = batch[H.job];
+      if (mode == 2 && p6[H.a] + p6[H.b] == J.T) ++ok;
+      if (mode == 3 && p6[H.a] + p6[H.b] + p6[H.c] == J.T) ++ok;
+      if (mode == 4 && p6[H.a] + p6[H.b] + p6[H.c] + p6[H.d] == J.T) ++ok;
+    }
+    printf("  find%d plant exact_hits=%llu (raw nh=%u)\n", mode,
+           (unsigned long long)ok, nh);
+    if (!ok) { printf("FAIL find%d plant\n", mode); gpu_free(g); return 1; }
+    hits_exact += ok;
+  }
+  gpu_free(g);
+  printf("[selftest-gpu] PASS (exact=%llu)\n", (unsigned long long)hits_exact);
+  return 0;
+}
+#endif
+
+static void usage() {
+  printf(
+      "usage: fourcore_find_v3 [--selftest-host] [--selftest-gpu]\n"
+      "   or: fourcore_find_v3 --units FILE.buc [options]\n"
+      "   or: fourcore_find_v3 --jobs FILE.but [options]\n"
+      " options: --N n --S bits --max-table-gb G --batch N --max-expand N\n"
+      "          --no-gate --stop-first --device K\n"
+      "  .buc: cls B u   |  .but: cls B u free1 free2 T_lo T_hi\n");
+}
+
+int main(int argc, char** argv) {
+  setvbuf(stdout, nullptr, _IOLBF, 0);
+  setvbuf(stderr, nullptr, _IOLBF, 0);
+
+  std::string units_path, jobs_path;
+  int N = 0, S_override = 0, device = 0;
+  double max_table_gb = 80.0;
+  u64 max_expand = 0;
+  size_t batch_units = 32;
+  bool use_gate = true, stop_first = false;
+  bool do_host = false, do_gpu = false;
+
+  for (int i = 1; i < argc; ++i) {
+    std::string s = argv[i];
+    auto next = [&]() -> std::string {
+      return (i + 1 < argc) ? std::string(argv[++i]) : std::string();
+    };
+    if (s == "--selftest-host") do_host = true;
+    else if (s == "--selftest-gpu") do_gpu = true;
+    else if (s == "--units") units_path = next();
+    else if (s == "--jobs") jobs_path = next();
+    else if (s == "--N") N = atoi(next().c_str());
+    else if (s == "--S") S_override = atoi(next().c_str());
+    else if (s == "--max-table-gb") max_table_gb = atof(next().c_str());
+    else if (s == "--max-expand") max_expand = strtoull(next().c_str(), nullptr, 10);
+    else if (s == "--batch") batch_units = (size_t)strtoull(next().c_str(), nullptr, 10);
+    else if (s == "--no-gate") use_gate = false;
+    else if (s == "--stop-first") stop_first = true;
+    else if (s == "--device") device = atoi(next().c_str());
+    else if (s == "-h" || s == "--help") { usage(); return 0; }
+    else { fprintf(stderr, "unknown %s\n", s.c_str()); usage(); return 1; }
+  }
+
+  if (do_host || argc == 1) return selftest_host();
+#ifdef HOST_ONLY
+  if (do_gpu) { fprintf(stderr, "HOST_ONLY: no --selftest-gpu\n"); return 1; }
+  fprintf(stderr, "HOST_ONLY build — use nvcc for GPU runs\n");
+  return 0;
+#else
+  if (do_gpu) {
+    CU(cudaSetDevice(device));
+    return selftest_gpu();
+  }
+  if (units_path.empty() && jobs_path.empty()) { usage(); return 1; }
+
+  CU(cudaSetDevice(device));
+  fc3::RootTables rt;
+  std::vector<Job> jobs;
+  u64 failT = 0;
+
+  if (!jobs_path.empty()) {
+    if (!load_jobs_but(jobs_path.c_str(), jobs)) {
+      fprintf(stderr, "failed to load %s\n", jobs_path.c_str());
+      return 1;
+    }
+    fprintf(stderr, "[jobs] loaded %zu from %s\n", jobs.size(), jobs_path.c_str());
+  } else {
+    std::vector<Job> units;
+    if (!load_units_buc(units_path.c_str(), units)) {
+      fprintf(stderr, "failed to load %s\n", units_path.c_str());
+      return 1;
+    }
+    fprintf(stderr, "[units] loaded %zu from %s — expanding (max_expand=%llu)\n",
+            units.size(), units_path.c_str(), (unsigned long long)max_expand);
+    bool cap = false;
+    for (size_t ui = 0; ui < units.size() && !cap; ++ui) {
+      expand_unit(rt, units[ui], jobs, failT, max_expand, cap);
+      if ((ui + 1) % 50 == 0 || ui + 1 == units.size())
+        fprintf(stderr, "[expand] units %zu/%zu -> jobs=%zu failT=%llu%s\n",
+                ui + 1, units.size(), jobs.size(), (unsigned long long)failT,
+                cap ? " (cap)" : "");
+    }
+  }
+
+  if (jobs.empty()) {
+    fprintf(stderr, "no jobs to run\n");
+    return 1;
+  }
+
+  u32 need = 0;
+  for (auto& J : jobs) need = std::max(need, J.lim);
+  if (N <= 0) N = (int)need;
+  if ((u32)N < need) N = (int)need;
+  if (N > 65535) {
+    fprintf(stderr, "[fatal] N=%d exceeds payload packing (B/42 > 65535)\n", N);
+    return 1;
+  }
+
+  int S = S_override > 0 ? S_override : choose_S(max_table_gb);
+  std::vector<Slot> slots;
+  table_build(N, S, slots);
+  GpuState g;
+  gpu_init(g, slots, S, use_gate);
+  std::vector<Slot>().swap(slots);
+
+  u64 sols = process_jobs(g, jobs, N, stop_first);
+  gpu_free(g);
+  printf("---- done: solutions=%llu jobs=%zu failT=%llu ----\n",
+         (unsigned long long)sols, jobs.size(), (unsigned long long)failT);
+  return 0;
+#endif
+}

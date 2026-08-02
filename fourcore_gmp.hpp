@@ -61,6 +61,31 @@ inline bool compute_T_peel2_gmp(u64 B, u64 u, u64 d, u64 e, u128& T_out) {
     return mpz_to_u128(num / den, T_out);
 }
 
+// Cached cls5 peel: reuse B^6, u^6, 42^6 across the (d,e) grid for one unit.
+struct Cls5PeelCtx {
+    mpz_class base;   // B^6 - u^6
+    mpz_class den;    // 42^6
+    bool ok = false;
+
+    void init(u64 B, u64 u) {
+        ok = false;
+        if (u >= B) return;
+        base = mpz_pow6(B) - mpz_pow6(u);
+        if (base <= 0) return;
+        den = mpz_pow6(42);
+        ok = true;
+    }
+
+    // T = (base - (21*d)^6 - (14*e)^6) / 42^6
+    bool peel(u64 d, u64 e, u128& T_out) const {
+        if (!ok || d < 1 || e < 1) return false;
+        mpz_class num = base - mpz_pow6(21 * d) - mpz_pow6(14 * e);
+        if (num <= 0) return false;
+        if (num % den != 0) return false;
+        return mpz_to_u128(num / den, T_out);
+    }
+};
+
 // Exact: B^6 == u^6 + D^6 * (x1^6+...+x4^6)
 inline bool verify_fourcore_gmp(u64 B, u64 u, u64 D,
                                 u64 x1, u64 x2, u64 x3, u64 x4) {

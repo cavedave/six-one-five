@@ -666,10 +666,9 @@ static u64 process_jobs(GpuState& g, std::vector<Job>& jobs, int N,
 
 // ------------------------------ selftests ----------------------------------
 static int selftest_host() {
-  printf("[selftest-host] gate + peel plants\n");
+  printf("[selftest-host] gate + peel plants + cls5 peel ctx\n");
   GateData gd; build_gate(gd);
   if (!gate_selftest_host(gd)) return 1;
-  fc3::RootTables rt;
   // find3 plant identity: T=3^6+4^6+5^6, peel reconstruct
   u128 T = pow6_full(3) + pow6_full(4) + pow6_full(5);
   u64 lo, hi; split_u128(T, lo, hi);
@@ -679,7 +678,72 @@ static int selftest_host() {
   if (!compute_T_peel1_gmp(100139, 73365, 14, 19, Tp)) {
     printf("FAIL peel1 sample\n"); return 1;
   }
+  // cls5 cached peel must match one-shot peel2 (past i128 wall too)
+  {
+    const u64 B = 2354027, u = 17646;  // admissible-ish; u may not be cls5 unit
+    // use known selftest pair from hunt_v3 cls5: B=100003 u=17646 d=9 e=44
+    const u64 B0 = 100003, u0 = 17646, d0 = 9, e0 = 44;
+    u128 T1 = 0, T2 = 0;
+    if (!compute_T_peel2_gmp(B0, u0, d0, e0, T1)) {
+      printf("FAIL peel2 sample\n"); return 1;
+    }
+    Cls5PeelCtx ctx;
+    ctx.init(B0, u0);
+    if (!ctx.ok || !ctx.peel(d0, e0, T2) || T1 != T2) {
+      printf("FAIL Cls5PeelCtx mismatch\n"); return 1;
+    }
+    ctx.init(B, u);  // smoke init past wall
+    if (!ctx.ok) { printf("FAIL Cls5PeelCtx past wall\n"); return 1; }
+    printf("[selftest-host] Cls5PeelCtx ok (T bits~%d)\n",
+           (int)(T1 ? 64 + ((T1 >> 64) ? 64 : 0) : 0));
+  }
   printf("[selftest-host] PASS\n");
+  return 0;
+}
+
+// Host-only / pre-GPU: stream-expand cls5 units and count jobs (no table).
+static int stream_cls5_count(const char* units_path, u64 max_expand, size_t progress_every) {
+  fc3::RootTables rt;
+  std::vector<Job> units;
+  if (!load_units_buc(units_path, units)) {
+    fprintf(stderr, "failed to load %s\n", units_path);
+    return 1;
+  }
+  u64 n5 = 0, jobs = 0, failT = 0, skip_cls = 0;
+  auto t0 = Clock::now();
+  for (size_t ui = 0; ui < units.size(); ++ui) {
+    const Job& U = units[ui];
+    if (U.cls != 5) { ++skip_cls; continue; }
+    ++n5;
+    Cls5PeelCtx ctx;
+    ctx.init(U.B, U.u);
+    if (!ctx.ok) { ++failT; continue; }
+    fc3::FreeTermSpec es, ds;
+    fc3::free_de_cls5(rt, (long long)U.B, (long long)U.u, es, ds);
+    fc3::for_each_free(es, [&](long long e) {
+      if (max_expand && jobs >= max_expand) return;
+      fc3::for_each_free(ds, [&](long long d) {
+        if (max_expand && jobs >= max_expand) return;
+        u128 T = 0;
+        if (!ctx.peel((u64)d, (u64)e, T)) { ++failT; return; }
+        if (T == 0) return;
+        ++jobs;
+      });
+    });
+    if (progress_every && (n5 % progress_every == 0)) {
+      const double sec = std::chrono::duration<double>(Clock::now() - t0).count();
+      fprintf(stderr, "[count-cls5] units=%llu jobs=%llu failT=%llu rate=%.2e jobs/s\n",
+              (unsigned long long)n5, (unsigned long long)jobs,
+              (unsigned long long)failT, sec > 0 ? jobs / sec : 0.0);
+    }
+    if (max_expand && jobs >= max_expand) break;
+  }
+  const double sec = std::chrono::duration<double>(Clock::now() - t0).count();
+  printf("---- count-cls5: units5=%llu skip_other=%llu jobs=%llu failT=%llu "
+         "time=%.1fs rate=%.3e jobs/s ----\n",
+         (unsigned long long)n5, (unsigned long long)skip_cls,
+         (unsigned long long)jobs, (unsigned long long)failT, sec,
+         sec > 0 ? jobs / sec : 0.0);
   return 0;
 }
 
@@ -774,9 +838,12 @@ static void usage() {
       "usage: fourcore_find_v3 [--selftest-host] [--selftest-gpu]\n"
       "   or: fourcore_find_v3 --units FILE.buc [options]\n"
       "   or: fourcore_find_v3 --jobs FILE.but [options]\n"
+      "   or: fourcore_find_v3 --stream-cls5 --units FILE.buc [options]\n"
       " options: --N n --S bits --max-table-gb G --batch N --max-expand N\n"
+      "          --count-only (stream-cls5: expand/count only, no GPU)\n"
       "          --no-gate --stop-first --device K\n"
-      "  .buc: cls B u   |  .but: cls B u free1 free2 T_lo T_hi\n");
+      "  .buc: cls B u   |  .but: cls B u free1 free2 T_lo T_hi\n"
+      "  --stream-cls5: expand cls5 (d,e) on the fly in GPU batches (no giant RAM list)\n");
 }
 
 int main(int argc, char** argv) {
@@ -787,9 +854,10 @@ int main(int argc, char** argv) {
   int N = 0, S_override = 0, device = 0;
   double max_table_gb = 80.0;
   u64 max_expand = 0;
-  size_t batch_units = 32;
+  size_t find2_batch = 4096;
   bool use_gate = true, stop_first = false;
   bool do_host = false, do_gpu = false;
+  bool stream_cls5 = false, count_only = false;
 
   for (int i = 1; i < argc; ++i) {
     std::string s = argv[i];
@@ -798,13 +866,15 @@ int main(int argc, char** argv) {
     };
     if (s == "--selftest-host") do_host = true;
     else if (s == "--selftest-gpu") do_gpu = true;
+    else if (s == "--stream-cls5") stream_cls5 = true;
+    else if (s == "--count-only") count_only = true;
     else if (s == "--units") units_path = next();
     else if (s == "--jobs") jobs_path = next();
     else if (s == "--N") N = atoi(next().c_str());
     else if (s == "--S") S_override = atoi(next().c_str());
     else if (s == "--max-table-gb") max_table_gb = atof(next().c_str());
     else if (s == "--max-expand") max_expand = strtoull(next().c_str(), nullptr, 10);
-    else if (s == "--batch") batch_units = (size_t)strtoull(next().c_str(), nullptr, 10);
+    else if (s == "--batch") find2_batch = (size_t)strtoull(next().c_str(), nullptr, 10);
     else if (s == "--no-gate") use_gate = false;
     else if (s == "--stop-first") stop_first = true;
     else if (s == "--device") device = atoi(next().c_str());
@@ -813,8 +883,17 @@ int main(int argc, char** argv) {
   }
 
   if (do_host || argc == 1) return selftest_host();
+
+  if (stream_cls5 && count_only) {
+    if (units_path.empty()) { usage(); return 1; }
+    return stream_cls5_count(units_path.c_str(), max_expand, 1);
+  }
+
 #ifdef HOST_ONLY
-  if (do_gpu) { fprintf(stderr, "HOST_ONLY: no --selftest-gpu\n"); return 1; }
+  if (do_gpu || (stream_cls5 && !count_only)) {
+    fprintf(stderr, "HOST_ONLY: use --count-only for stream-cls5, or nvcc build for GPU\n");
+    return 1;
+  }
   fprintf(stderr, "HOST_ONLY build — use nvcc for GPU runs\n");
   return 0;
 #else
@@ -826,6 +905,109 @@ int main(int argc, char** argv) {
 
   CU(cudaSetDevice(device));
   fc3::RootTables rt;
+
+  // ---- streaming cls5: expand (d,e) → find2 batches, never store full job list ----
+  if (stream_cls5) {
+    if (units_path.empty()) { usage(); return 1; }
+    std::vector<Job> units;
+    if (!load_units_buc(units_path.c_str(), units)) {
+      fprintf(stderr, "failed to load %s\n", units_path.c_str());
+      return 1;
+    }
+    u32 need = 0;
+    u64 n5 = 0;
+    for (auto& U : units) {
+      if (U.cls != 5) continue;
+      ++n5;
+      need = std::max(need, U.lim);
+    }
+    if (!n5) { fprintf(stderr, "no cls5 units in %s\n", units_path.c_str()); return 1; }
+    if (N <= 0) N = (int)need;
+    if ((u32)N < need) N = (int)need;
+    if (N > 65535) {
+      fprintf(stderr, "[fatal] N=%d exceeds payload packing\n", N);
+      return 1;
+    }
+    fprintf(stderr,
+            "[stream-cls5] units_file=%s cls5_units=%llu N=%d batch=%zu max_expand=%llu\n",
+            units_path.c_str(), (unsigned long long)n5, N, find2_batch,
+            (unsigned long long)max_expand);
+
+    int S = S_override > 0 ? S_override : choose_S(max_table_gb);
+    std::vector<Slot> slots;
+    table_build(N, S, slots);
+    GpuState g;
+    gpu_init(g, slots, S, use_gate);
+    std::vector<Slot>().swap(slots);
+
+    std::vector<u128> p6(N + 1);
+    for (int x = 1; x <= N; ++x) p6[x] = pow6_full((u64)x);
+
+    std::vector<Job> batch;
+    batch.reserve(find2_batch);
+    u64 jobs_done = 0, failT = 0, sols = 0, units_done = 0;
+    auto t0 = Clock::now();
+    bool stop = false;
+
+    auto flush = [&]() {
+      if (batch.empty()) return;
+      sols += run_batch(g, batch, /*mode=*/2, &p6);
+      jobs_done += batch.size();
+      batch.clear();
+    };
+
+    for (size_t ui = 0; ui < units.size() && !stop; ++ui) {
+      const Job& U = units[ui];
+      if (U.cls != 5) continue;
+      ++units_done;
+      Cls5PeelCtx ctx;
+      ctx.init(U.B, U.u);
+      if (!ctx.ok) { ++failT; continue; }
+      fc3::FreeTermSpec es, ds;
+      fc3::free_de_cls5(rt, (long long)U.B, (long long)U.u, es, ds);
+      fc3::for_each_free(es, [&](long long e) {
+        if (stop) return;
+        fc3::for_each_free(ds, [&](long long d) {
+          if (stop) return;
+          if (max_expand && jobs_done + batch.size() >= max_expand) {
+            stop = true;
+            return;
+          }
+          u128 T = 0;
+          if (!ctx.peel((u64)d, (u64)e, T)) { ++failT; return; }
+          if (T == 0) return;
+          Job J = U;
+          J.free1 = (u64)d;
+          J.free2 = (u64)e;
+          J.T = T;
+          batch.push_back(J);
+          if (batch.size() >= find2_batch) flush();
+        });
+      });
+      if (units_done % 5 == 0 || ui + 1 == units.size()) {
+        const double sec = std::chrono::duration<double>(Clock::now() - t0).count();
+        fprintf(stderr,
+                "[stream-cls5] units=%llu/%llu jobs=%llu failT=%llu sols=%llu "
+                "%.1fs (%.2e jobs/s)\n",
+                (unsigned long long)units_done, (unsigned long long)n5,
+                (unsigned long long)jobs_done, (unsigned long long)failT,
+                (unsigned long long)sols, sec,
+                sec > 0 ? jobs_done / sec : 0.0);
+      }
+      if (stop_first && sols) break;
+    }
+    flush();
+    gpu_free(g);
+    const double sec = std::chrono::duration<double>(Clock::now() - t0).count();
+    printf("---- done stream-cls5: solutions=%llu jobs=%llu units=%llu failT=%llu "
+           "time=%.1fs%s ----\n",
+           (unsigned long long)sols, (unsigned long long)jobs_done,
+           (unsigned long long)units_done, (unsigned long long)failT, sec,
+           stop && max_expand ? " (hit --max-expand)" : "");
+    return 0;
+  }
+
+  // ---- legacy: load-all expand then process ----
   std::vector<Job> jobs;
   u64 failT = 0;
 

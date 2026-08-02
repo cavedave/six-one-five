@@ -123,3 +123,48 @@ stdbuf -oL -eL nohup ./fourcore_find_v3 --units runs/fc_v3_234_2p35_2p36.buc \
 |---|---|
 | `.buc` | `cls B u` |
 | `.but` | `cls B u free1 free2 T_lo T_hi` |
+
+---
+
+## cls5 streaming (post cls2–4 clearance)
+
+Do **not** full-expand cls5. Use `--stream-cls5` (batch find2 on the fly).
+
+### Stage 1 — host checks (no GPU)
+
+```bash
+make fourcore-find-v3   # or fourcore-find-v3-host for count-only / selftest-host
+./fourcore_find_v3 --selftest-host
+
+# Emit a tiny cls5 unit file past the wall:
+./fourcore_hunt_v3 --lo 2353974 --hi 2354000 --classes 5 \
+  --emit-units runs/fc_v3_cls5_tiny.buc
+wc -l runs/fc_v3_cls5_tiny.buc
+head runs/fc_v3_cls5_tiny.buc
+
+# Count expand rate only (caps jobs):
+./fourcore_find_v3 --stream-cls5 --count-only \
+  --units runs/fc_v3_cls5_tiny.buc --max-expand 200000
+```
+
+Paste selftest + count lines before Stage 2.
+
+### Stage 2 — GPU smoke (capped)
+
+```bash
+./fourcore_find_v3 --selftest-gpu
+./fourcore_find_v3 --stream-cls5 --units runs/fc_v3_cls5_tiny.buc \
+  --max-expand 500000 --max-table-gb 80 --batch 4096 \
+  > runs/fc_v3_cls5_smoke.log 2>&1
+tail -30 runs/fc_v3_cls5_smoke.log
+```
+
+### Stage 3 — first real strip (after smoke OK)
+
+```bash
+./fourcore_hunt_v3 --lo 2353974 --hi 2355000 --classes 5 \
+  --emit-units runs/fc_v3_cls5_2p35_2p355.buc
+stdbuf -oL -eL nohup ./fourcore_find_v3 --stream-cls5 \
+  --units runs/fc_v3_cls5_2p35_2p355.buc --max-table-gb 80 --batch 4096 \
+  > runs/fc_v3_cls5_2p35_2p355.log 2>&1 &
+```

@@ -445,12 +445,17 @@ struct GpuState {
   int S = 0;
   size_t tab_slots = 0;
   bool use_gate = true;
+  bool quiet = false;                 // suppress per-batch [gate] lines
+  u64 tot_calls = 0, tot_gated = 0, tot_probes = 0;
 };
 
-static void gpu_init(GpuState& g, const std::vector<Slot>& slots, int S, bool use_gate) {
+static void gpu_init(GpuState& g, const std::vector<Slot>& slots, int S, bool use_gate,
+                     bool quiet = false) {
   g.S = S;
   g.tab_slots = slots.size();
   g.use_gate = use_gate;
+  g.quiet = quiet;
+  g.tot_calls = g.tot_gated = g.tot_probes = 0;
   CU(cudaMalloc(&g.d_tab, slots.size() * sizeof(Slot)));
   CU(cudaMemcpy(g.d_tab, slots.data(), slots.size() * sizeof(Slot), cudaMemcpyHostToDevice));
   GateData gd; build_gate(gd);
@@ -593,7 +598,10 @@ static u64 run_batch(GpuState& g, const std::vector<Job>& jobs, int mode,
   CU(cudaMemcpy(&calls, g.d_calls, sizeof(u64), cudaMemcpyDeviceToHost));
   CU(cudaMemcpy(&gated, g.d_gated, sizeof(u64), cudaMemcpyDeviceToHost));
   CU(cudaMemcpy(&probes, g.d_probes, sizeof(u64), cudaMemcpyDeviceToHost));
-  if (calls)
+  g.tot_calls += calls;
+  g.tot_gated += gated;
+  g.tot_probes += probes;
+  if (calls && !g.quiet)
     fprintf(stderr, "[gate] batch n=%zu mode=%d calls=%llu gated=%llu probes=%llu gate=%.1f%%\n",
             cands.size(), mode, (unsigned long long)calls, (unsigned long long)gated,
             (unsigned long long)probes, 100.0 * (double)gated / (double)calls);
@@ -841,7 +849,8 @@ static void usage() {
       "   or: fourcore_find_v3 --stream-cls5 --units FILE.buc [options]\n"
       " options: --N n --S bits --max-table-gb G --batch N --max-expand N\n"
       "          --count-only (stream-cls5: expand/count only, no GPU)\n"
-      "          --no-gate --stop-first --device K\n"
+      "          --quiet (no per-batch [gate] lines; stream-cls5 defaults on)\n"
+      "          --no-quiet --no-gate --stop-first --device K\n"
       "  .buc: cls B u   |  .but: cls B u free1 free2 T_lo T_hi\n"
       "  --stream-cls5: expand cls5 (d,e) on the fly in GPU batches (no giant RAM list)\n");
 }
@@ -858,6 +867,7 @@ int main(int argc, char** argv) {
   bool use_gate = true, stop_first = false;
   bool do_host = false, do_gpu = false;
   bool stream_cls5 = false, count_only = false;
+  int quiet_flag = -1;  // -1 = default (on for stream-cls5), 0/1 explicit
 
   for (int i = 1; i < argc; ++i) {
     std::string s = argv[i];
@@ -868,6 +878,8 @@ int main(int argc, char** argv) {
     else if (s == "--selftest-gpu") do_gpu = true;
     else if (s == "--stream-cls5") stream_cls5 = true;
     else if (s == "--count-only") count_only = true;
+    else if (s == "--quiet") quiet_flag = 1;
+    else if (s == "--no-quiet") quiet_flag = 0;
     else if (s == "--units") units_path = next();
     else if (s == "--jobs") jobs_path = next();
     else if (s == "--N") N = atoi(next().c_str());
@@ -881,6 +893,7 @@ int main(int argc, char** argv) {
     else if (s == "-h" || s == "--help") { usage(); return 0; }
     else { fprintf(stderr, "unknown %s\n", s.c_str()); usage(); return 1; }
   }
+  const bool quiet = (quiet_flag >= 0) ? (quiet_flag != 0) : stream_cls5;
 
   if (do_host || argc == 1) return selftest_host();
 
@@ -937,7 +950,7 @@ int main(int argc, char** argv) {
     std::vector<Slot> slots;
     table_build(N, S, slots);
     GpuState g;
-    gpu_init(g, slots, S, use_gate);
+    gpu_init(g, slots, S, use_gate, quiet);
     std::vector<Slot>().swap(slots);
 
     std::vector<u128> p6(N + 1);
@@ -984,14 +997,17 @@ int main(int argc, char** argv) {
           if (batch.size() >= find2_batch) flush();
         });
       });
-      if (units_done % 5 == 0 || ui + 1 == units.size()) {
+      // Progress every 25 units (quiet-friendly); always on last.
+      if (units_done % 25 == 0 || units_done == n5 || stop) {
         const double sec = std::chrono::duration<double>(Clock::now() - t0).count();
+        const double gate_pct = g.tot_calls
+            ? 100.0 * (double)g.tot_gated / (double)g.tot_calls : 0.0;
         fprintf(stderr,
                 "[stream-cls5] units=%llu/%llu jobs=%llu failT=%llu sols=%llu "
-                "%.1fs (%.2e jobs/s)\n",
+                "gate=%.1f%% %.1fs (%.2e jobs/s)\n",
                 (unsigned long long)units_done, (unsigned long long)n5,
                 (unsigned long long)jobs_done, (unsigned long long)failT,
-                (unsigned long long)sols, sec,
+                (unsigned long long)sols, gate_pct, sec,
                 sec > 0 ? jobs_done / sec : 0.0);
       }
       if (stop_first && sols) break;

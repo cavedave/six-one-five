@@ -15,7 +15,8 @@ struct RibbonFilter {
 };
 
 // Build a ribbon filter over fp64 keys. Throws or returns empty on failure.
-// TODO(M1): implement BuRR-style construction with seed-retry.
+// TODO(M4): BuRR-style construction with seed-retry.
+// M1 staging structure is xor_filter.hpp (use that for A100 path first).
 inline RibbonFilter build_ribbon(const std::vector<RibbonKey>& keys, int rank = 48, int word_bits = 64) {
     (void)keys;
     (void)rank;

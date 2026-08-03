@@ -168,3 +168,21 @@ stdbuf -oL -eL nohup ./fourcore_find_v3 --stream-cls5 \
   --units runs/fc_v3_cls5_2p35_2p355.buc --max-table-gb 80 --batch 4096 \
   > runs/fc_v3_cls5_2p35_2p355.log 2>&1 &
 ```
+
+---
+
+## cls5 GPU peel (faster — after stream frees the GPU)
+
+`fourcore_cls5_gpu_v3`: one GMP `B^6-u^6` per unit, then v3-style `(d,e)` grid on GPU (192-bit).
+
+**VRAM:** past-wall cls5 needs `N≈56k` → `S≥31` (~34 GB) minimum; with `--max-table-gb 80` it picks `S=32` (~69 GB). That will OOM if `stream-cls5` already holds an ~80 GB table on the same GPU. Check `nvidia-smi` first; do not run both at once.
+
+```bash
+nvidia-smi   # confirm free memory / only one fourcore process
+make fourcore-cls5-gpu-v3
+./fourcore_cls5_gpu_v3 --selftest-host
+
+./fourcore_cls5_gpu_v3 --units runs/fc_v3_cls5_2p35_2p354.buc --max-table-gb 80 \
+  > runs/fc_v3_cls5_gpu_2p35_2p354.log 2>&1
+# Compare wall time / solutions=0 to the stream-cls5 log on the same .buc.
+```

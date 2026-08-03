@@ -35,8 +35,14 @@ mkdir -p runs
 ./fourcore_hunt --lo 2353974 --hi 2355000 --D 42 --emit runs/fc_smoke.but
 wc -l runs/fc_smoke.but
 
+# Optional deep floursum filter (~14% keep; necessary condition on T):
+./fourcore_filter --selftest
+./fourcore_filter < runs/fc_smoke.but > runs/fc_smoke.deep.but \
+  --write-rej runs/fc_smoke.rej.but 2> runs/fc_filter_smoke.log
+wc -l runs/fc_smoke.deep.but
+
 # Server GPU (N ≈ B/42 ≈ 56k at 2.35M — small table):
-./fourcore_find4 --jobs runs/fc_smoke.but --D 42 --max-table-gb 80
+./fourcore_find4 --jobs runs/fc_smoke.deep.but --D 42 --max-table-gb 80
 ```
 
 ## First campaign (iteration goal)
@@ -61,6 +67,7 @@ Optional find-ONE cut: `--x4-top 5000 --stop-first` on `fourcore_find4`.
 |---|---|
 | `fourcore_gmp.hpp` | GMP \(T\) + verify |
 | `fourcore_hunt.cpp` | Stage‑1 \((B,u)\) + emit `.but` |
+| `fourcore_filter.cpp` | Deep floursum prefilter → `.deep.but` (~14% keep) |
 | `fourcore_find4.cu` | Pair table + GPU find4 |
 
 Job line format: `B u T_lo T_hi`.

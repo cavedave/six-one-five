@@ -1,11 +1,35 @@
 # Binaries
 solve_516_v3
 solve_516_v2
+solve_516_v4
 solve_616_v1
+solve_617_v1
 v3_host_logic_test
 spike/ribbon/ribbon_filter_test
+spike/ribbon/xor_filter_test
+fourcore_hunt
+fourcore_hunt_v3
+fourcore_filter
+fourcore_find4
+fourcore_find4_host
+fourcore_find_v3
+fourcore_find_v3_host
+fourcore_cls5_gpu_v3
+fourcore_cls5_gpu_v3_host
+record_hunt
+record_find5
+record_find5_host
+record_probe
 *.o
 *.out
+
+# Lean build / vendored packages
+lean/.lake/
+
+# Large local archives
+*.zip
+Archive.zip
+logs.zip
 
 # GPU pair-sum table cache (multi-GB)
 table_*.bin
@@ -13,6 +37,8 @@ table_*.bin
 
 # Campaign logs and checkpoints
 runs/
+runs 2/
+runs*/
 *.log
 *.stderr
 

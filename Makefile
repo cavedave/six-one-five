@@ -3,8 +3,8 @@
 
 .PHONY: all v3 v3-a100 v4-a100 v616 v617 v2 test host-test \
         ribbon-test xor-test record record-host \
-        fourcore fourcore-host fourcore-hunt-v3 fourcore-find-v3 \
-        fourcore-find-v3-host clean
+        fourcore fourcore-host fourcore-filter fourcore-hunt-v3 fourcore-find-v3 \
+        fourcore-find-v3-host fourcore-cls5-gpu-v3 fourcore-cls5-gpu-v3-host clean
 
 NVCC ?= nvcc
 CXX ?= g++
@@ -105,15 +105,20 @@ record-host: record_find5.cu
 	$(CXX) -O3 -std=c++17 -DHOST_ONLY -Wno-unknown-pragmas -x c++ -o record_find5_host $<
 
 # ---- (6,1,5) four-core D=42h hunter (post-i128, GMP host math) ----
-fourcore: fourcore_hunt fourcore_find4
+fourcore: fourcore_hunt fourcore_filter fourcore_find4
 
 fourcore_hunt: fourcore_hunt.cpp fourcore_gmp.hpp
 	$(CXX) $(FOURCORE_CXXFLAGS) -o $@ $< $(GMP_LDFLAGS) $(GMP_LIBS)
 
+# Deep floursum prefilter (no GMP): keep ~14% of cls1 .but jobs before find4.
+fourcore-filter: fourcore_filter
+fourcore_filter: fourcore_filter.cpp
+	$(CXX) -O3 -std=c++17 -o $@ $<
+
 fourcore_find4: fourcore_find4.cu fourcore_gmp.hpp
 	$(NVCC) $(FOURCORE_NVCCFLAGS) -o $@ $< $(GMP_LDFLAGS) $(GMP_LIBS)
 
-fourcore-host: fourcore_hunt fourcore_find4_host
+fourcore-host: fourcore_hunt fourcore_filter fourcore_find4_host
 
 fourcore_find4_host: fourcore_find4.cu fourcore_gmp.hpp
 	$(CXX) $(FOURCORE_CXXFLAGS) -DHOST_ONLY -Wno-unknown-pragmas -x c++ \
@@ -136,10 +141,23 @@ fourcore_find_v3_host: fourcore_find_v3.cu fourcore_classes_v3.hpp fourcore_gmp.
 	$(CXX) $(FOURCORE_CXXFLAGS) -DHOST_ONLY -Wno-unknown-pragmas -x c++ \
 	  -o $@ $< $(GMP_LDFLAGS) $(GMP_LIBS)
 
+# cls5 GPU peel (192-bit base; one GMP per unit)
+fourcore-cls5-gpu-v3: fourcore_cls5_gpu_v3
+
+fourcore_cls5_gpu_v3: fourcore_cls5_gpu_v3.cu fourcore_classes_v3.hpp fourcore_gmp.hpp
+	$(NVCC) $(FOURCORE_NVCCFLAGS) -o $@ $< $(GMP_LDFLAGS) $(GMP_LIBS)
+
+fourcore-cls5-gpu-v3-host: fourcore_cls5_gpu_v3_host
+
+fourcore_cls5_gpu_v3_host: fourcore_cls5_gpu_v3.cu fourcore_classes_v3.hpp fourcore_gmp.hpp
+	$(CXX) $(FOURCORE_CXXFLAGS) -DHOST_ONLY -Wno-unknown-pragmas -x c++ \
+	  -o $@ $< $(GMP_LDFLAGS) $(GMP_LIBS)
+
 clean:
 	rm -f solve_516_v3 solve_516_v3_a100 solve_516_v4 solve_516_v2 \
 	      solve_616_v1 solve_617_v1 \
 	      v3_host_logic_test spike/ribbon/ribbon_filter_test spike/ribbon/xor_filter_test \
 	      record_hunt record_find5 record_probe record_find5_host \
-	      fourcore_hunt fourcore_find4 fourcore_find4_host \
-	      fourcore_hunt_v3 fourcore_find_v3 fourcore_find_v3_host *.o
+	      fourcore_hunt fourcore_filter fourcore_find4 fourcore_find4_host \
+	      fourcore_hunt_v3 fourcore_find_v3 fourcore_find_v3_host \
+	      fourcore_cls5_gpu_v3 fourcore_cls5_gpu_v3_host *.o

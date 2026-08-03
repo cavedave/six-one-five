@@ -30,27 +30,46 @@ A CUDA meet-in-the-middle solver for the Diophantine equation
 a₁⁶ + a₂⁶ + a₃⁶ + a₄⁶ + a₅⁶ = B⁶        ("(6,1,5)" in Lander–Parkin–Selfridge notation)
 ```
 
-**Headline result:** no primitive solution exists with **B ≤ 2,200,000**
-(extension run to B ≤ 2,353,973 — the 128-bit arithmetic ceiling — in progress;
-update this line when the final summary lands).
-The previous published bound was B ≤ 730,000 (Resta & Meyrignac, 2002) [^1^].
-No solution of (6,1,5) is known at all; if one exists, it is a counterexample
-to Euler's sum-of-powers conjecture for k=6, and the Lander–Parkin–Selfridge
-conjecture (k = m + n) would need k > 6 terms to fail [^1^].
+**Headline result:** no primitive solution found in any Meyrignac class through
+the bounds below (prior published bound: B ≤ 730,000, Resta & Meyrignac 2002
+[^1^]). No solution of (6,1,5) is known at all; if one exists, it is a
+counterexample to Euler's sum-of-powers conjecture for k=6, and the
+Lander–Parkin–Selfridge conjecture (k = m + n) would need k > 6 terms to fail
+[^1^].
 
-## Result summary
+### The three search branches (Meyrignac classes)
+
+Every admissible primitive candidate (`gcd(B,42)=1`) falls in exactly one of
+five Meyrignac classes. The class is fixed by **which factors of 42 divide
+which terms** (the odd / not-divisible-by-3 / not-divisible-by-7 roles).
+Operationally we run them as **three** pipelines (classes 2–4 share machinery):
+
+| Branch | Classes | Forced divisibility (besides unit \(u\)) | Unit \(u\) |
+|---|---|---|---|
+| **÷42 four-core** | **cls1** | four terms each divisible by **42** | odd and \(\gcd(u,42)=1\) (144 seeds mod \(42^6\)) |
+| **one free ×14 / ×21 / ×7** | **cls2–4** | three terms ÷**42**; free term ÷**14** (cls2), ÷**21** (cls3), or ÷**7** (cls4) | cls2: odd, divisible by 3 but not 9 (24 seeds mod \(14^6\)); cls3: even, \(\gcd(u,21)=1\) (36 mod \(21^6\)); cls4: divisible by 6 but not 7 (6 mod \(7^6\)) |
+| **two frees ×21 and ×14** | **cls5** | two terms ÷**42**; frees ÷**21** and ÷**14** | divisible by 6 but not 7 (6 seeds mod \(7^6\)) |
+
+Equivalently: after writing cores as \(42c_i\) (and frees as \(14d\), \(21e\), …),
+each class reduces to a smaller equal-sum search on the seeds. Full residue
+tables are under “The five Meyrignac classes” below.
+
+### Coverage cleared (0 solutions)
+
+Eligible \(B\) only (`gcd(B,42)=1`). Bounds are inclusive of the search windows run.
+
+| Branch | Cleared through | Notes |
+|---|---|---|
+| **All five classes** | **B ≤ 2,353,973** | `solve_516_v3` (i128 ceiling on \(B^6\)) |
+| **cls2–4** | **B ≤ 2,752,470** | post-wall `fourcore_hunt_v3` + `fourcore_find_v3`; pair-index ceiling \(N=B/42\le 65535\) |
+| **cls5** | **B ≤ 2,752,470** | same ceiling; post-wall stream + GPU peel (`fourcore_cls5_gpu_v3`) |
+| **cls1** | **B ≤ 3,680,000** | post-wall `fourcore_hunt` + `fourcore_find4` (`D=42`); can push higher than cls2–5 because find4 allows larger \(N\) |
 
 | Item | Value |
 |---|---|
-| Range searched (this run) | B ∈ [1,010,231, 2,200,000], all classes |
-| Prior coverage (same project, CPU) | B ∈ [0, 1,010,231] |
 | Independent published coverage | B ≤ 730,000 (Resta–Meyrignac) [^1^] |
-| Result | **0 solutions** |
-| Probes executed | 4.60 × 10¹³ |
-| Sustained probe rate | 1.42 × 10¹⁰ probes/s |
-| GPU kernel time | 53.8 min (55 min wall) |
-| Fingerprint false positives | 2,264 — all rejected by exact CPU verification, 0 missed |
-| Hardware | NVIDIA RTX PRO 6000 Blackwell (188 SMs, 102 GB), 24 CPU threads |
+| Result in all cleared bands above | **0 solutions** |
+| Hardware | NVIDIA RTX PRO 6000 Blackwell (188 SMs, ~98–102 GB) |
 
 
 

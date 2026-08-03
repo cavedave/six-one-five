@@ -85,11 +85,20 @@ calc for 91.8% of them.
 ### Measurement gate (do this first for Idea A)
 
 1. Count launched vs active blocks — already known via `tri_total` / `tri_skipped`
-   (91.8% skip).
-2. Timing A/B: early-return **before** `gate_load` on skipped blocks vs current
-   (`gate_load`-then-skip). Delta = dead-block overhead ceiling.
-   - If >~20% of cls5 time → build precompaction.
-   - If <~5% → skip; pivot to window-narrowing.
+   (~91% skip at 530k–950k with tri-gate ON).
+2. **Dead-block A/B (implemented in `solve_616_v1.cu`):** defer `gate_load` until
+   after `s_active` is known (default **on**). `--no-defer-gate-load` restores the
+   old path (gate_load on every block, then skip). Compare cls5 `kernel` seconds:
+
+   ```bash
+   ./solve_616_v1 530000 630000 all --bench 4                         # defer ON
+   ./solve_616_v1 530000 630000 all --bench 4 --no-defer-gate-load    # baseline
+   ```
+
+   `exact` / `fp-false` / `probes` must match; only cls5 wall time may differ.
+   - If delta >~10–20% of cls5 time → defer stays on; host precompaction only if
+     you still need more (skip block launches entirely).
+   - If delta <~5% → dead-block overhead is small; pivot to window-narrowing or MLP.
 
 ---
 

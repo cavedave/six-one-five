@@ -476,6 +476,7 @@ struct Params {
     const u64* __restrict__ t247;
     u64* __restrict__ tri_skipped;  // blocks killed by the triple-sum gate
     u64* __restrict__ tri_total;    // blocks that reached the gate (valid window)
+    u32 defer_gate_load;            // cls5: gate_load only after s_active (not before)
 };
 
 // ------------------------------------------- device 64/128-bit primitives --
@@ -648,7 +649,10 @@ __global__ void k_cls234(Params P) {
     __shared__ int s_active;
     __shared__ u32 s_t504, s_t247;
     __shared__ GateSh s_gate;
-    gate_load(s_gate, P);
+    // Baseline (defer off): gate_load on every launched block, then maybe return.
+    // Optimized (defer on):  thread 0 decides s_active first; dead blocks never
+    // load the ~1.6 KB gate bitmaps into shared memory.
+    if (!P.defer_gate_load) gate_load(s_gate, P);
     if (threadIdx.x == 0) {
         s_active = 0;
         u64 fh, fl; pow6_128(P.factor * d, fh, fl);              // (21*w')^6
@@ -687,6 +691,7 @@ __global__ void k_cls234(Params P) {
     }
     __syncthreads();
     if (!s_active) return;
+    if (P.defer_gate_load) gate_load(s_gate, P);
     const u64 tfp = s_tfp;
     const u32 lo = s_lo, hi = s_hi;
     const u32 t504 = s_t504, t247 = s_t247;
@@ -755,6 +760,7 @@ struct GpuCtx {
     u64* d_tri_skipped = nullptr;
     u64* d_tri_total = nullptr;
     bool tri_ready = false, tri_on = true;
+    bool defer_gate_load = true;    // cls5: skip gate_load on dead blocks (A/B: --no-defer-gate-load)
 };
 
 static void gpu_init(GpuCtx& g, int device, u32 hit_cap) {
@@ -992,6 +998,7 @@ static RunResult gpu_run(GpuCtx& g, int cls, const std::vector<GpuCand>& v, u64 
     P.use_tri_gate = (cls == 5 && g.tri_ready && g.tri_on) ? 1u : 0u;
     P.t504 = g.d_t504; P.t247 = g.d_t247;
     P.tri_skipped = g.d_tri_skipped; P.tri_total = g.d_tri_total;
+    P.defer_gate_load = (cls == 5 && g.defer_gate_load) ? 1u : 0u;
 
     u32 ymax = 1;
     if (cls <= 4) ymax = 32;                       // 2048-c4 chunks (window <= ~11k at N=65535)
@@ -1446,6 +1453,7 @@ int main(int argc, char** argv) {
     u32 hit_cap = 1u << 20;
     std::string save_table, load_table;
     bool opt_selftest = false, opt_xcheck = false, quiet = false, opt_nogate = false, opt_notri = false;
+    bool opt_no_defer_gate = false;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--selftest") opt_selftest = true;
@@ -1453,6 +1461,7 @@ int main(int argc, char** argv) {
         else if (a == "--quiet") quiet = true;
         else if (a == "--no-gate") opt_nogate = true;
         else if (a == "--no-tri-gate") opt_notri = true;
+        else if (a == "--no-defer-gate-load") opt_no_defer_gate = true;
         else if (a == "--chunk" && i + 1 < argc) chunk = atoll(argv[++i]);
         else if (a == "--device" && i + 1 < argc) device = atoi(argv[++i]);
         else if (a == "--slots-log2" && i + 1 < argc) slots_log2 = atoi(argv[++i]);
@@ -1494,6 +1503,7 @@ int main(int argc, char** argv) {
             "           --save-table F --load-table F --bench [K] --xcheck --quiet\n"
             "           --no-gate (disable the mod-124,488 probe gate, for A/B bench)\n"
             "           --no-tri-gate (disable the cls5 triple-sum window gate)\n"
+            "           --no-defer-gate-load (cls5: gate_load before skip; A/B baseline)\n"
             "           %s --selftest\n", argv[0], argv[0]);
         return 1;
     }
@@ -1517,6 +1527,10 @@ int main(int argc, char** argv) {
     gpu_init(g, device, hit_cap);
     g.gate_on = !opt_nogate;
     g.tri_on = !opt_notri;
+    g.defer_gate_load = !opt_no_defer_gate;
+    if (!quiet)
+        fprintf(stderr, "[gpu] cls5 defer gate_load: %s\n",
+                g.defer_gate_load ? "on (skip gate_load on dead blocks)" : "off (A/B baseline)");
     {
         GateData gd;
         build_gate(gd);

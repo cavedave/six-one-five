@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <utility>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -64,6 +65,8 @@ inline std::size_t capacity_for(std::size_t n) {
     return cap;
 }
 
+// [MEM-4] No longer used by construct_with_seed (fingerprints are written
+// straight into `packed`). Kept for other translation units in the tree.
 inline void pack_from_cells(XorFilter& out, const std::vector<std::uint64_t>& cells,
                             std::uint32_t r) {
     const std::size_t nbytes = xor_packed_bytes(cells.size(), r);
@@ -93,16 +96,20 @@ inline bool construct_with_seed(const std::vector<std::uint64_t>& keys, std::uin
     const std::uint32_t block = static_cast<std::uint32_t>(array_len / 3);
 
     std::vector<std::uint64_t> setxor(array_len, 0);
-    std::vector<std::uint32_t> counts(array_len, 0);
-    std::vector<std::uint64_t> hashes_v(n);
+    // [MEM-3] u16 instead of u32. Incidence counts are Poisson with mean 3/1.23
+    // ~ 2.4; 65535 is unreachable for any realistic key set, but guard anyway
+    // rather than wrap silently.
+    std::vector<std::uint16_t> counts(array_len, 0);
+    // [MEM-1] hashes_v deleted — it was write-only.
 
     for (std::size_t i = 0; i < n; ++i) {
         const std::uint64_t h = key_hash(keys[i], seed);
-        hashes_v[i] = h;
         std::uint32_t hs[3];
         hashes(h, block, hs);
         for (int t = 0; t < 3; ++t) {
             setxor[hs[t]] ^= h;
+            if (counts[hs[t]] == 0xffffu)
+                throw std::runtime_error("build_xor: cell incidence count overflowed u16");
             counts[hs[t]] += 1;
         }
     }
@@ -135,9 +142,17 @@ inline bool construct_with_seed(const std::vector<std::uint64_t>& keys, std::uin
 
     if (stack.size() != n) return false;  // peel stalled — retry seed
 
-    // Assign fingerprints into a temporary u64 array, then bit-pack.
-    std::vector<std::uint64_t> cells(array_len, 0);
+    // Free the peel scratch we no longer need before allocating the output.
+    { std::vector<std::uint64_t>().swap(setxor); }
+    { std::vector<std::uint16_t>().swap(counts); }
+    { std::vector<std::uint32_t>().swap(queue); }
+
+    // [MEM-4] Assign fingerprints directly into the bit-packed buffer. The old
+    // code staged them in a u64 array the same length as the output (8 bytes
+    // per cell instead of r/8) and packed afterwards. Reading a neighbour cell
+    // through xor_load_cell is exact, so the result is identical.
     const std::uint64_t mask = xor_fp_mask(r);
+    out.packed.assign(xor_packed_bytes(array_len, r), 0);
 
     for (std::size_t k = stack.size(); k-- > 0;) {
         const PeelEntry& e = stack[k];
@@ -145,9 +160,9 @@ inline bool construct_with_seed(const std::vector<std::uint64_t>& keys, std::uin
         hashes(e.hash, block, hs);
         std::uint64_t xorv = fingerprint(e.hash, r);
         for (int t = 0; t < 3; ++t) {
-            if (hs[t] != e.index) xorv ^= (cells[hs[t]] & mask);
+            if (hs[t] != e.index) xorv ^= xor_load_cell(out.packed.data(), hs[t], r);
         }
-        cells[e.index] = xorv & mask;
+        xor_store_cell(out.packed.data(), e.index, r, xorv & mask);
     }
 
     out.hdr.magic = store615::kMagic;
@@ -163,8 +178,7 @@ inline bool construct_with_seed(const std::vector<std::uint64_t>& keys, std::uin
     out.hdr.shard_index = 0;
     out.hdr.shard_mode = static_cast<std::uint32_t>(store615::ShardMode::KeyModS);
     out.hdr.reserved = 0;  // packed layout (version >= 2)
-    pack_from_cells(out, cells, r);
-    return true;
+    return true;  // [MEM-4] packed was filled in place above
 }
 
 }  // namespace xor_detail
@@ -177,13 +191,15 @@ inline std::vector<std::uint64_t> xor_unique_keys(std::vector<std::uint64_t> key
 }
 
 // Build xor filter. Throws if construction fails after max_seed_tries.
-inline XorFilter build_xor(const std::vector<std::uint64_t>& keys_in, int rank = 48,
+// [MEM-2] Takes the key vector BY VALUE and moves it through the dedup step, so
+// only one copy is ever live. Call it as build_xor(std::move(keys), r).
+inline XorFilter build_xor(std::vector<std::uint64_t> keys_in, int rank = 48,
                            std::uint64_t base_seed = 0x615615615615615ULL,
                            int max_seed_tries = 64) {
     if (rank <= 0 || rank > 64) {
         throw std::invalid_argument("build_xor: rank must be in 1..64");
     }
-    const std::vector<std::uint64_t> keys = xor_unique_keys(keys_in);
+    const std::vector<std::uint64_t> keys = xor_unique_keys(std::move(keys_in));
     XorFilter f;
     for (int try_i = 0; try_i < max_seed_tries; ++try_i) {
         const std::uint64_t seed = base_seed + static_cast<std::uint64_t>(try_i) * 0x9E3779B97F4A7C15ULL;

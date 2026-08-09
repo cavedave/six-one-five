@@ -172,7 +172,10 @@ int main() {
     // Higher rank, fewer probes — just check no FN + no FP storm
     test_no_fn_and_fpr(/*n=*/50'000, /*r=*/32, /*n_probe=*/500'000);
 
-    // E0 extension: real (i^6+j^6) keys — packing + r sweep
+    // E0 extension: real (i^6+j^6) keys — packing + r sweep.
+    // N=200 first (lean MEM smoke); N=2000 catches packing at campaign r values.
+    test_real_pair_keys(/*N=*/200, /*r=*/16);
+    test_real_pair_keys(/*N=*/200, /*r=*/48);
     test_real_pair_keys(/*N=*/2000, /*r=*/48);
     test_real_pair_keys(/*N=*/2000, /*r=*/40);
     test_real_pair_keys(/*N=*/2000, /*r=*/32);

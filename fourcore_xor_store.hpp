@@ -79,7 +79,7 @@ inline XorFilter xor_build_pairs(int N, int r) {
     for (int j = i; j <= N; ++j)
       keys.push_back((std::uint64_t)pw6[(size_t)i] + (std::uint64_t)pw6[(size_t)j]);
   const auto t0 = std::chrono::steady_clock::now();
-  XorFilter f = build_xor(keys, r);
+  XorFilter f = build_xor(std::move(keys), r);
   f.hdr.N = (std::uint32_t)N;
   const double ms =
       std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0)

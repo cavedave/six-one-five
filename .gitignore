@@ -7,6 +7,7 @@ solve_617_v1
 v3_host_logic_test
 spike/ribbon/ribbon_filter_test
 spike/ribbon/xor_filter_test
+spike/ribbon/xor_store_io_test
 fourcore_hunt
 fourcore_hunt_v3
 fourcore_filter
@@ -16,6 +17,10 @@ fourcore_find_v3
 fourcore_find_v3_host
 fourcore_cls5_gpu_v3
 fourcore_cls5_gpu_v3_host
+fourcore_find_v4
+fourcore_find_v4_host
+fourcore_cls5_gpu_v4
+fourcore_cls5_gpu_v4_host
 record_hunt
 record_find5
 record_find5_host
@@ -53,3 +58,8 @@ runs*/
 *.pem
 *_credentials*
 secrets.*
+secrets/*
+!secrets/*.example
+vast.env
+.vast_api_key
+.venv-vast/

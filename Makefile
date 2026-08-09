@@ -1,10 +1,12 @@
 # six-one-five — GPU search for a₁⁶+…+a₅⁶ = B⁶
 # Also: record-style (6,1,7) hunt helpers (record_hunt / record_find5).
 
-.PHONY: all v3 v3-a100 v4-a100 v616 v617 v2 test host-test \
-        ribbon-test xor-test record record-host \
+.PHONY: all v3 v3-a100 v4 v4-a100 v616 v617 v624 v2 test host-test \
+        ribbon-test xor-test xor-io-test xor-build-save record record-host \
         fourcore fourcore-host fourcore-filter fourcore-hunt-v3 fourcore-find-v3 \
-        fourcore-find-v3-host fourcore-cls5-gpu-v3 fourcore-cls5-gpu-v3-host clean
+        fourcore-find-v3-host fourcore-cls5-gpu-v3 fourcore-cls5-gpu-v3-host \
+        fourcore-find-v4 fourcore-find-v4-host \
+        fourcore-cls5-gpu-v4 fourcore-cls5-gpu-v4-host clean
 
 NVCC ?= nvcc
 CXX ?= g++
@@ -51,13 +53,21 @@ v3-a100: solve_516_v3_a100
 solve_516_v3_a100: solve_516_v3.cu mod60.hpp quad_sum.hpp k14_common.hpp
 	$(NVCC) $(NVCCFLAGS_A100) -o $@ $<
 
-# M2+: xor/ribbon store fork (fails clearly until solve_516_v4.cu exists)
-v4-a100:
-	@if [ ! -f solve_516_v4.cu ]; then \
-	  echo "solve_516_v4.cu not forked yet (plan M2). For T0 use: make v3-a100"; \
-	  exit 1; \
-	fi
-	$(NVCC) $(NVCCFLAGS_A100) -o solve_516_v4 solve_516_v4.cu
+# M2: xor-filter pair store (solve_516_v4.cu)
+NVCCFLAGS_V4 = $(NVCCFLAGS) -Xcompiler -fopenmp
+v4: solve_516_v4
+
+solve_516_v4: solve_516_v4.cu mod60.hpp quad_sum.hpp k14_common.hpp \
+              spike/ribbon/xor_filter.hpp spike/ribbon/xor_pack.hpp \
+              spike/ribbon/mix64.hpp spike/ribbon/store_header.hpp
+	$(NVCC) $(NVCCFLAGS_V4) -o $@ $<
+
+v4-a100: solve_516_v4_a100
+
+solve_516_v4_a100: solve_516_v4.cu mod60.hpp quad_sum.hpp k14_common.hpp \
+                   spike/ribbon/xor_filter.hpp spike/ribbon/xor_pack.hpp \
+                   spike/ribbon/mix64.hpp spike/ribbon/store_header.hpp
+	$(NVCC) $(NVCCFLAGS_A100) -o $@ $<
 
 v616: solve_616_v1
 
@@ -87,6 +97,11 @@ ribbon-test:
 xor-test:
 	$(CXX) -O2 -std=c++20 -o spike/ribbon/xor_filter_test spike/ribbon/xor_filter_test.cpp
 	./spike/ribbon/xor_filter_test
+
+# Lean Step 2: packed xor save/load roundtrip + N-mismatch + FPR smoke (no GPU)
+xor-io-test:
+	$(CXX) -O2 -std=c++20 -I. -o spike/ribbon/xor_store_io_test spike/ribbon/xor_store_io_test.cpp
+	./spike/ribbon/xor_store_io_test
 
 # ---- record-style (6,1,7) hunt (j=2 / 294-normalized) ----
 record: record_hunt record_find5 record_probe
@@ -127,7 +142,8 @@ fourcore_find4_host: fourcore_find4.cu fourcore_gmp.hpp
 # ---- (6,1,5) multi-class post-i128 hunt (host-only Stage 1–2, *_v3) ----
 fourcore-hunt-v3: fourcore_hunt_v3
 
-fourcore_hunt_v3: fourcore_hunt_v3.cpp fourcore_classes_v3.hpp fourcore_gmp.hpp
+fourcore_hunt_v3: fourcore_hunt_v3.cpp fourcore_classes_v3.hpp fourcore_gmp.hpp \
+                  fourcore_job_bin.hpp
 	$(CXX) $(FOURCORE_CXXFLAGS) -o $@ $< $(GMP_LDFLAGS) $(GMP_LIBS)
 
 fourcore-find-v3: fourcore_find_v3
@@ -153,11 +169,61 @@ fourcore_cls5_gpu_v3_host: fourcore_cls5_gpu_v3.cu fourcore_classes_v3.hpp fourc
 	$(CXX) $(FOURCORE_CXXFLAGS) -DHOST_ONLY -Wno-unknown-pragmas -x c++ \
 	  -o $@ $< $(GMP_LDFLAGS) $(GMP_LIBS)
 
+# ---- v4: same post-i128 fourcore, xor pair store (N can exceed 65535) ----
+FOURCORE_V4_DEPS = fourcore_classes_v3.hpp fourcore_gmp.hpp fourcore_xor_store.hpp \
+	fourcore_job_bin.hpp fourcore_find_device.cuh \
+	spike/ribbon/xor_filter.hpp spike/ribbon/xor_pack.hpp spike/ribbon/mix64.hpp \
+	spike/ribbon/store_header.hpp
+
+fourcore-find-v4: fourcore_find_v4
+
+fourcore_find_v4: fourcore_find_v4.cu $(FOURCORE_V4_DEPS)
+	$(NVCC) $(FOURCORE_NVCCFLAGS) -o $@ $< $(GMP_LDFLAGS) $(GMP_LIBS)
+
+fourcore-find-v4-host: fourcore_find_v4_host
+
+fourcore_find_v4_host: fourcore_find_v4.cu $(FOURCORE_V4_DEPS)
+	$(CXX) $(FOURCORE_CXXFLAGS) -DHOST_ONLY -Wno-unknown-pragmas -x c++ \
+	  -o $@ $< $(GMP_LDFLAGS) $(GMP_LIBS)
+
+# ---- (6,2,4) Resta GPU search ----
+v624: solve_624_v1
+v624-host: solve_624_v1_host
+
+# Default: PTX compute_90 (JIT on newer GPUs). On Blackwell, prefer:
+#   make v624 NVCCFLAGS_ARCH='-gencode arch=compute_120,code=sm_120'
+NVCCFLAGS_ARCH ?=
+solve_624_v1: solve_624_v1.cu solve_624_mod.hpp $(FOURCORE_V4_DEPS)
+	$(NVCC) $(FOURCORE_NVCCFLAGS) $(NVCCFLAGS_ARCH) -o $@ $< $(GMP_LDFLAGS) $(GMP_LIBS)
+
+solve_624_v1_host: solve_624_v1.cu solve_624_mod.hpp $(FOURCORE_V4_DEPS)
+	$(CXX) $(FOURCORE_CXXFLAGS) -DHOST_ONLY -Wno-unknown-pragmas -x c++ \
+	  -o $@ $< $(GMP_LDFLAGS) $(GMP_LIBS)
+
+fourcore-cls5-gpu-v4: fourcore_cls5_gpu_v4
+
+fourcore_cls5_gpu_v4: fourcore_cls5_gpu_v4.cu $(FOURCORE_V4_DEPS)
+	$(NVCC) $(FOURCORE_NVCCFLAGS) -o $@ $< $(GMP_LDFLAGS) $(GMP_LIBS)
+
+fourcore-cls5-gpu-v4-host: fourcore_cls5_gpu_v4_host
+
+fourcore_cls5_gpu_v4_host: fourcore_cls5_gpu_v4.cu $(FOURCORE_V4_DEPS)
+	$(CXX) $(FOURCORE_CXXFLAGS) -DHOST_ONLY -Wno-unknown-pragmas -x c++ \
+	  -o $@ $< $(GMP_LDFLAGS) $(GMP_LIBS)
+
+# Host-only packed xor builder (no GPU). Peak RAM tens of GB at large N.
+xor-build-save: xor_build_save
+xor_build_save: xor_build_save.cpp fourcore_xor_store.hpp $(FOURCORE_V4_DEPS)
+	$(CXX) $(FOURCORE_CXXFLAGS) -o $@ $< $(FOURCORE_OMP)
+
 clean:
-	rm -f solve_516_v3 solve_516_v3_a100 solve_516_v4 solve_516_v2 \
-	      solve_616_v1 solve_617_v1 \
+	rm -f solve_516_v3 solve_516_v3_a100 solve_516_v4 solve_516_v4_a100 solve_516_v2 \
+	      solve_616_v1 solve_617_v1 solve_624_v1 solve_624_v1_host \
 	      v3_host_logic_test spike/ribbon/ribbon_filter_test spike/ribbon/xor_filter_test \
+	      spike/ribbon/xor_store_io_test \
 	      record_hunt record_find5 record_probe record_find5_host \
 	      fourcore_hunt fourcore_filter fourcore_find4 fourcore_find4_host \
 	      fourcore_hunt_v3 fourcore_find_v3 fourcore_find_v3_host \
-	      fourcore_cls5_gpu_v3 fourcore_cls5_gpu_v3_host *.o
+	      fourcore_cls5_gpu_v3 fourcore_cls5_gpu_v3_host \
+	      fourcore_find_v4 fourcore_find_v4_host \
+	      fourcore_cls5_gpu_v4 fourcore_cls5_gpu_v4_host xor_build_save *.o

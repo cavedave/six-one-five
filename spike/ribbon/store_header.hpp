@@ -7,7 +7,8 @@
 namespace store615 {
 
 constexpr std::uint32_t kMagic = 0x53353136u;  // '615S' little-endian-ish
-constexpr std::uint32_t kVersion = 1;
+// v1: u64 cells (legacy). v2: bit-packed r-bit cells (xor_pack.hpp).
+constexpr std::uint32_t kVersion = 2;
 
 enum class Kind : std::uint32_t {
     Table = 0,

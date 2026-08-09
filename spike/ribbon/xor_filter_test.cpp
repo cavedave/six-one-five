@@ -118,6 +118,47 @@ static void test_ribbon_stub() {
     expect(pass == (int)keys.size(), "ribbon stub permissive");
 }
 
+// E0: real pair-sum keys k_ij = i^6+j^6 (mod 2^64), same as campaign store.
+static void test_real_pair_keys(int N, int r) {
+    std::vector<std::uint64_t> pw6((size_t)N + 1, 0);
+    for (int x = 1; x <= N; ++x) {
+        const std::uint64_t x2 = (std::uint64_t)x * (std::uint64_t)x;
+        pw6[(size_t)x] = x2 * x2 * x2;
+    }
+    std::vector<std::uint64_t> keys;
+    keys.reserve((size_t)N * (size_t)(N + 1) / 2);
+    for (int i = 1; i <= N; ++i)
+        for (int j = i; j <= N; ++j) keys.push_back(pw6[(size_t)i] + pw6[(size_t)j]);
+
+    const XorFilter f = build_xor(keys, r);
+    std::size_t fn = 0;
+    for (std::uint64_t k : keys)
+        if (!xor_might_contain(f, k)) ++fn;
+    expect(fn == 0, "real-pair: FN count must be 0");
+    const double packed = f.store_gb() * 1e9;
+    const double u64eq = f.unpacked_u64_gb() * 1e9;
+    expect(f.packed.size() == xor_packed_bytes(f.hdr.m_cells, f.hdr.r), "packed byte count");
+    expect(packed < u64eq * 0.9 || r >= 64, "packed smaller than u64 cells when r<64");
+    std::printf("  real-pair N=%d keys=%zu r=%d cells=%llu FN=%zu packed=%.3f MB "
+                "(u64-equiv=%.3f MB, ratio=%.3f)\n",
+                N, keys.size(), r, (unsigned long long)f.hdr.m_cells, fn, packed / 1e6,
+                u64eq / 1e6, u64eq > 0 ? packed / u64eq : 0.0);
+}
+
+static void test_pack_size_table() {
+    std::printf("  pack size model (logical cells = 1.23*n):\n");
+    for (int N : {2000, 10000, 47857, 65535, 71428}) {
+        const double n = (double)N * (N + 1) / 2.0;
+        const std::size_t cells = xor_detail::capacity_for((std::size_t)n);
+        for (int r : {32, 40, 48}) {
+            const double packed = xor_packed_gb(cells, (std::uint32_t)r);
+            const double u64 = cells * 8.0 / 1e9;
+            std::printf("    N=%-5d r=%-2d  packed=%.2f GB  u64=%.2f GB  save=%.0f%%\n", N, r,
+                        packed, u64, 100.0 * (1.0 - packed / u64));
+        }
+    }
+}
+
 int main() {
     std::printf("xor_filter_test: starting\n");
     test_tiny();
@@ -130,6 +171,12 @@ int main() {
     test_no_fn_and_fpr(/*n=*/100'000, /*r=*/16, /*n_probe=*/2'000'000);
     // Higher rank, fewer probes — just check no FN + no FP storm
     test_no_fn_and_fpr(/*n=*/50'000, /*r=*/32, /*n_probe=*/500'000);
+
+    // E0 extension: real (i^6+j^6) keys — packing + r sweep
+    test_real_pair_keys(/*N=*/2000, /*r=*/48);
+    test_real_pair_keys(/*N=*/2000, /*r=*/40);
+    test_real_pair_keys(/*N=*/2000, /*r=*/32);
+    test_pack_size_table();
 
     if (g_fails) {
         std::fprintf(stderr, "xor_filter_test: %d FAIL(s)\n", g_fails);

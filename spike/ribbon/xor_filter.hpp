@@ -1,10 +1,12 @@
 #pragma once
 // Classic 3-hash xor filter (Graf & Lemire), host builder + query.
-// Staging structure before ribbon (615-ribbon-filter-plan.md §6, R1).
-// Campaign plan: ../../615-a100-ribbon-shard-plan.md M1.
+// Cells are bit-packed to `r` bits each (xor_pack.hpp). Staging before ribbon.
+// Design: ../../615-ribbon-filter-plan.md §6, R1.
+// On-disk: StoreHeader version 2 + packed bytes (see xor_packed_bytes).
 
 #include "mix64.hpp"
 #include "store_header.hpp"
+#include "xor_pack.hpp"
 
 #include <algorithm>
 #include <cstdint>
@@ -14,18 +16,24 @@
 
 struct XorFilter {
     store615::StoreHeader hdr{};
-    std::vector<std::uint64_t> cells;  // length = hdr.m_cells; low r bits used
+    std::vector<std::uint8_t> packed;  // bit-packed fingerprints + 8-byte pad
 
-    std::uint64_t fp_mask() const {
-        return hdr.r >= 64 ? ~0ULL : ((1ULL << hdr.r) - 1ULL);
+    std::uint64_t fp_mask() const { return xor_fp_mask(hdr.r); }
+
+    std::size_t store_bytes() const { return packed.size(); }
+
+    double store_gb() const { return packed.size() / 1e9; }
+
+    // Unpacked equivalent size (legacy u64 cells) for A/B logs.
+    double unpacked_u64_gb() const {
+        return hdr.m_cells * 8.0 / 1e9;
     }
 };
 
 namespace xor_detail {
 
 inline std::uint64_t fingerprint(std::uint64_t hash, std::uint32_t r) {
-    if (r >= 64) return hash;
-    return hash & ((1ULL << r) - 1ULL);
+    return hash & xor_fp_mask(r);
 }
 
 // Map hash -> three cell indices in [0, 3*block).
@@ -56,6 +64,14 @@ inline std::size_t capacity_for(std::size_t n) {
     return cap;
 }
 
+inline void pack_from_cells(XorFilter& out, const std::vector<std::uint64_t>& cells,
+                            std::uint32_t r) {
+    const std::size_t nbytes = xor_packed_bytes(cells.size(), r);
+    out.packed.assign(nbytes, 0);
+    for (std::size_t i = 0; i < cells.size(); ++i)
+        xor_store_cell(out.packed.data(), i, r, cells[i]);
+}
+
 inline bool construct_with_seed(const std::vector<std::uint64_t>& keys, std::uint32_t r,
                                 std::uint64_t seed, XorFilter& out) {
     const std::size_t n = keys.size();
@@ -69,7 +85,7 @@ inline bool construct_with_seed(const std::vector<std::uint64_t>& keys, std::uin
         out.hdr.n_keys = 0;
         out.hdr.m_cells = 0;
         out.hdr.shard_count = 1;
-        out.cells.clear();
+        out.packed.clear();
         return true;
     }
 
@@ -119,8 +135,9 @@ inline bool construct_with_seed(const std::vector<std::uint64_t>& keys, std::uin
 
     if (stack.size() != n) return false;  // peel stalled — retry seed
 
-    out.cells.assign(array_len, 0);
-    const std::uint64_t mask = (r >= 64) ? ~0ULL : ((1ULL << r) - 1ULL);
+    // Assign fingerprints into a temporary u64 array, then bit-pack.
+    std::vector<std::uint64_t> cells(array_len, 0);
+    const std::uint64_t mask = xor_fp_mask(r);
 
     for (std::size_t k = stack.size(); k-- > 0;) {
         const PeelEntry& e = stack[k];
@@ -128,9 +145,9 @@ inline bool construct_with_seed(const std::vector<std::uint64_t>& keys, std::uin
         hashes(e.hash, block, hs);
         std::uint64_t xorv = fingerprint(e.hash, r);
         for (int t = 0; t < 3; ++t) {
-            if (hs[t] != e.index) xorv ^= (out.cells[hs[t]] & mask);
+            if (hs[t] != e.index) xorv ^= (cells[hs[t]] & mask);
         }
-        out.cells[e.index] = xorv & mask;
+        cells[e.index] = xorv & mask;
     }
 
     out.hdr.magic = store615::kMagic;
@@ -145,7 +162,8 @@ inline bool construct_with_seed(const std::vector<std::uint64_t>& keys, std::uin
     out.hdr.shard_count = 1;
     out.hdr.shard_index = 0;
     out.hdr.shard_mode = static_cast<std::uint32_t>(store615::ShardMode::KeyModS);
-    out.hdr.reserved = 0;
+    out.hdr.reserved = 0;  // packed layout (version >= 2)
+    pack_from_cells(out, cells, r);
     return true;
 }
 
@@ -179,13 +197,13 @@ inline XorFilter build_xor(const std::vector<std::uint64_t>& keys_in, int rank =
 
 inline bool xor_might_contain(const XorFilter& f, std::uint64_t key) {
     if (f.hdr.n_keys == 0) return false;
-    if (f.cells.empty() || f.hdr.m_cells < 3) return false;
+    if (f.packed.empty() || f.hdr.m_cells < 3) return false;
     const std::uint32_t block = static_cast<std::uint32_t>(f.hdr.m_cells / 3);
     const std::uint64_t h = xor_detail::key_hash(key, f.hdr.mix_seed);
     std::uint32_t hs[3];
     xor_detail::hashes(h, block, hs);
-    const std::uint64_t mask = f.fp_mask();
-    const std::uint64_t got =
-        (f.cells[hs[0]] ^ f.cells[hs[1]] ^ f.cells[hs[2]]) & mask;
+    const std::uint64_t got = xor_load_cell(f.packed.data(), hs[0], f.hdr.r) ^
+                              xor_load_cell(f.packed.data(), hs[1], f.hdr.r) ^
+                              xor_load_cell(f.packed.data(), hs[2], f.hdr.r);
     return got == xor_detail::fingerprint(h, f.hdr.r);
 }

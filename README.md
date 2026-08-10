@@ -20,6 +20,23 @@ found with `solve_617_v1` Branch A. None appear in the prior EulerNet clean list
 
 Each row satisfies \(\sum a_i^6 = B^6\) with \(\gcd(a_1,\ldots,a_7,B)=1\).
 
+### Recombination of found relations
+
+Taking known equal sums of sixth powers as generators and combining them
+(pairwise / short triples with cancellation) yields further identities. This is
+bookkeeping on the catalog, not a smaller search for (6,1,5). A short run over
+198 generators (`recombination_report.md`) found three frontier improvements
+(verify failures: 0), including:
+
+| Form | Identity |
+|:---|:---|
+| (6,6,6) | \(130326^6+93240^6+87486^6+72254^6+26481^6+3486^6\) \(=\) \(121800^6+106260^6+96145^6+92400^6+54600^6+40950^6\) |
+| (6,7,7) | \(244463^6+8598^6+7884^6+7601^6+6882^6+5496^6+4482^6\) \(=\) \(241962^6+138159^6+127176^6+105700^6+75894^6+13104^6+10031^6\) |
+| (6,8,8) | \(10073^6+8598^6+7884^6+7601^6+6882^6+5844^6+5496^6+4482^6\) \(=\) \(10031^6+8858^6+7719^6+7584^6+6750^6+6000^6+5142^6+1122^6\) |
+
+The same pass also lists many longer \((6,6,12)\) triples (six terms cancel
+between signed generators). Full lists and overlap stats: `recombination_report.md`.
+
 ---
 
 ## (6,1,5) — five terms = one sixth power
@@ -54,15 +71,38 @@ Equivalently: after writing cores as \(42c_i\) (and frees as \(14d\), \(21e\), �
 each class reduces to a smaller equal-sum search on the seeds. Full residue
 tables are under “The five Meyrignac classes” below.
 
+**Classes partition solution shapes, not \(B\).** Every eligible \(B\)
+(\(\gcd(B,42)=1\), about \(2/7\) of all integers) is searched in **all five**
+classes: for each class we ask “if a solution at this \(B\) had this role
+pattern, which units \(u\) (and frees) are allowed?” Your example is right —
+the same \(B=4101101\) is run through cls5 *and* cls2 *and* …; a true hit
+lands in exactly one class. Near \(B\sim3\)M, Stage‑1 **units per eligible \(B\)**
+are roughly cls1 ~0.06, cls2 ~2, cls3 ~0.5, cls4 ~25, cls5 ~25 — so about
+**~0.1% / 4% / 1% / 48% / 48%** of units (not of \(B\)). Almost every eligible
+\(B\) has cls4 and cls5 work; cls1 is sparse.
+
 ### Coverage cleared (0 solutions)
 
 Eligible \(B\) only (`gcd(B,42)=1`). Bounds are inclusive of the search windows run.
 
+> **WARNING — cls5 production binary**
+>
+> For post-i128 **class 5**, always use **`fourcore_cls5_gpu_v4`** (or `_v3`):
+> ```bash
+> ./fourcore_hunt_v3 --lo LO --hi HI --classes 5 --emit-units runs/….buc
+> ./fourcore_cls5_gpu_v4 --units runs/….buc --r 48
+> # or prebuilt table (recommended past ~3.2M):
+> ./fourcore_cls5_gpu_v4 --units runs/….buc --N K --load-table runs/xor_NK_r48.bin
+> ```
+> Do **not** use `fourcore_find_v4 --stream-cls5` for production. That path expands
+> the \((d,e)\) grid on the **host** and is ~**1000× slower** (weeks vs minutes on
+> the same band). `--stream-cls5` is debug/count-only. See `search_density_and_rates.md`.
+
 | Branch | Cleared through | Notes |
 |---|---|---|
 | **All five classes** | **B ≤ 2,353,973** | `solve_516_v3` (i128 ceiling on \(B^6\)) |
-| **cls2–4** | **B ≤ 2,752,470** | post-wall `fourcore_hunt_v3` + `fourcore_find_v3`; pair-index ceiling \(N=B/42\le 65535\) |
-| **cls5** | **B ≤ 2,752,470** | same ceiling; post-wall stream + GPU peel (`fourcore_cls5_gpu_v3`) |
+| **cls2–4** | **B ≤ 3,000,000** | post-wall `fourcore_find_v4` (also logged through 2,752,470 as `fc_v3_234_*`) |
+| **cls5** | **B ≤ 3,500,000** | Post-wall **`fourcore_cls5_gpu_v4`** + lean xor builder (`MEM-1..4`) and **`--load-table`**: 2.36→2.75 (~16 min), 2.75→3.0, 3.0→3.2, then **3.2→3.5** (`fc_cls5_gpu_3200001_3500000` — **done**, 0 sols, ~22 min GPU with prebuilt `xor_N83333_r48.bin`). Host peel at \(N=83333\) peaks ~**132 GiB** RSS (~23 min); packed store ~**26 GB** on disk. Next band 3.5→4.0M needs \(N=95238\), ~**34 GB** packed (~**40 GB** free disk to save). |
 | **cls1** | **B ≤ 3,680,000** | post-wall `fourcore_hunt` + `fourcore_find4` (`D=42`); can push higher than cls2–5 because find4 allows larger \(N\) |
 
 | Item | Value |
@@ -70,6 +110,44 @@ Eligible \(B\) only (`gcd(B,42)=1`). Bounds are inclusive of the search windows 
 | Independent published coverage | B ≤ 730,000 (Resta–Meyrignac) [^1^] |
 | Result in all cleared bands above | **0 solutions** |
 | Hardware | NVIDIA RTX PRO 6000 Blackwell (188 SMs, ~98–102 GB) |
+
+### Cls5 xor storage (disk + host RAM)
+
+One packed table covers cls5 through \(B_{\max}\approx 42N\) (\(N=\lfloor B/42\rfloor\)).
+Build with `xor_build_save --N K --r 48 --out runs/xor_NK_r48.bin`, then GPU
+`--load-table` (no host peel on the search job). Allow **packed size + ~5 GB**
+free disk when saving; delete the previous `.bin` if space is tight.
+
+| Target \(B_{\max}\) | \(N\) | Packed `.bin` | Free disk (save) | Lean build peak RAM | Fits 102 GB GPU? |
+|---:|---:|---:|---:|---:|:---:|
+| 3.5M | 83333 | ~26 GB | ~31 GB | ~132 GB | yes |
+| 4.0M | 95238 | ~34 GB | ~40 GB | ~170 GB | yes |
+| 4.5M | 107142 | ~42 GB | ~47 GB | ~220 GB | yes |
+| **5.0M** | 119047 | ~**52 GB** | ~**60 GB** | ~**145 GB** | yes |
+| 5.04M (soft cap) | 120000 | ~53 GB | ~60 GB | ~146 GB | yes |
+| **10M** | ~238095 | ~**210 GB** | — | ~**575 GB** | **no** |
+
+**Practical disk today:** with ~28 GB free after clearing old tables, add about
+**30 GB more** (~**60 GB total free**) to build and save the **5 M** table in one
+shot. Stepping 3.5→4.0→4.5→5.0M needs only one table on disk at a time if you
+delete the previous `.bin` after each band clears.
+
+**10 M:** a single xor table does **not** fit current hardware (VRAM, host RAM,
+or practical disk). Needs **pair-space shards** and/or **ribbon** (roadmap) —
+not “more disk” alone. Soft code cap today is \(N\le120{,}000\) (`kXorNSoftMax`).
+
+### (6,2,4) coverage
+
+Primitive \(a^6+b^6=c^6+d^6+e^6+f^6\) (Resta cases A+B), max left term \(a\).
+
+| Range | Result | Notes |
+|---|---|---|
+| \(a\le 30{,}400\) | **0 sols** | Matches Resta–Meyrignac published clear; local PRO 6000 ~957 s |
+| \(a\in(30400,\;79100]\) | **0 sols** | Vast.ai `624_v2_*` campaign (checkpointed) |
+| \(a\in[79100,\;100000]\) | **0 sols** | PRO 6000 `solve_624_v1`, `CLEARED` in **15744 s (~4.4 h)**, `seedN=16035` |
+| \(a\in(100000,\;120000]\) | **0 sols** | `six-one-five-624-v2` `solve_624_v1`, `seedN=19242`, `CLEARED` in **28566 s (~7.9 h)**, `xor_N19242_r48.bin` (~1.3 GB) |
+
+Published prior: no primitive solutions with \(a\le30400\) (Resta–Meyrignac).
 
 
 
@@ -253,8 +331,11 @@ Sound by construction — real pair sums always pass. The same gate ships in
 3. **Ports of the same engine** (k=6 machinery is class-generic):
    **(6,1,6)** — `solve_616_v1.cu` (in progress; see section above);
    **(6,1,7)** — `solve_617_v1.cu` (Branch A producing new primitives; see above);
-   **(6,2,4)** — sum of four sixth powers = sum of two — is *open* and has
-   exactly this MITM shape (targets become pair sums instead of B⁶−u⁶).
+   **(6,2,4)** — `solve_624_v1.cu` / `make v624` (Resta Case A=find2, Case B=find3;
+   shared `fourcore_find_device.cuh` + xor). **Cleared primitive \(a\le120000\)** (0 sols);
+   extending toward 150 k+. Use v2 seed \(N=\lfloor 2^{1/6}\texttt{hi}/7\rfloor\) and
+   matching `--load-table`. Host: `./solve_624_v1_host --cpu --lo LO --hi HI --case all`.
+   See coverage table above and `six-one-five-624-v2/README_VAST.txt`.
 4. **Near-miss logging:** threshold the residual stream to tabulate record
    `|a₁⁶+…+a₅⁶ − B⁶|` minima — a byproduct worth publishing on its own.
 

@@ -159,10 +159,23 @@ static void test_pack_size_table() {
     }
 }
 
+static void test_peel_retry_keeps_keys() {
+    // Adversarial keys that force at least one failed seed before success.
+    // If MEM-5 freed keys on a failed peel, a later retry would build an empty filter.
+    std::vector<std::uint64_t> keys;
+    keys.reserve(5000);
+    for (std::size_t i = 0; i < 5000; ++i) keys.push_back(0xDEADBEEF00000000ULL + i);
+    const XorFilter f = build_xor(std::move(keys), 16, /*base_seed=*/1ULL, /*max_seed_tries=*/64);
+    expect(f.hdr.n_keys == 5000, "peel-retry: n_keys");
+    expect(!f.packed.empty(), "peel-retry: packed non-empty");
+    expect(xor_might_contain(f, 0xDEADBEEF00000000ULL), "peel-retry: FN on first key");
+}
+
 int main() {
     std::printf("xor_filter_test: starting\n");
     test_tiny();
     test_duplicates_ok();
+    test_peel_retry_keeps_keys();
     test_shard_partition();
     test_ribbon_stub();
 

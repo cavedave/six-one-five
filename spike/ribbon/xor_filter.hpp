@@ -75,9 +75,11 @@ inline void pack_from_cells(XorFilter& out, const std::vector<std::uint64_t>& ce
         xor_store_cell(out.packed.data(), i, r, cells[i]);
 }
 
-// [MEM-5] Keys are only needed for the incidence loop. On peel success, free
-// them before allocating `packed` (and while peel temps may still be live).
-// On peel failure, keys are kept so build_xor can retry with another seed.
+// [MEM-5]/MEM-6] Keys are only needed for the incidence loop.
+// MEM-6: free them *before* allocating the peel stack (~8n bytes, e.g. ~36 GB
+// at N=95238). That cuts the peak that OOMs at ~230 GB on a 283 GB host.
+// On peel failure keys are already gone — build_xor cannot retry in-place and
+// must regenerate the key vector (rare with load factor 1.23).
 inline bool construct_with_seed(std::vector<std::uint64_t>& keys, std::uint32_t r,
                                 std::uint64_t seed, XorFilter& out) {
     const std::size_t n = keys.size();
@@ -117,6 +119,9 @@ inline bool construct_with_seed(std::vector<std::uint64_t>& keys, std::uint32_t 
         }
     }
 
+    // [MEM-6] Drop keys before stack/queue (~8n). Peel uses only setxor/counts.
+    { std::vector<std::uint64_t>().swap(keys); }
+
     std::vector<PeelEntry> stack;
     stack.reserve(n);
     std::vector<std::uint32_t> queue;
@@ -143,11 +148,7 @@ inline bool construct_with_seed(std::vector<std::uint64_t>& keys, std::uint32_t 
         }
     }
 
-    if (stack.size() != n) return false;  // peel stalled — retry seed
-
-    // [MEM-5] ~8n bytes (e.g. ~36 GB at N=95238). Safe: peel succeeded; keys unused
-    // from here on. Failed peels return above with keys intact for seed retry.
-    { std::vector<std::uint64_t>().swap(keys); }
+    if (stack.size() != n) return false;  // peel stalled; keys already freed (MEM-6)
 
     // Free the peel scratch we no longer need before allocating the output.
     { std::vector<std::uint64_t>().swap(setxor); }
@@ -200,6 +201,8 @@ inline std::vector<std::uint64_t> xor_unique_keys(std::vector<std::uint64_t> key
 // Build xor filter. Throws if construction fails after max_seed_tries.
 // [MEM-2] Takes the key vector BY VALUE and moves it through the dedup step, so
 // only one copy is ever live. Call it as build_xor(std::move(keys), r).
+// [MEM-6] Keys are released after incidence (before peel stack). A peel stall
+// then throws — regenerate keys and call again (see xor_build_pairs outer loop).
 inline XorFilter build_xor(std::vector<std::uint64_t> keys_in, int rank = 48,
                            std::uint64_t base_seed = 0x615615615615615ULL,
                            int max_seed_tries = 64) {
@@ -207,15 +210,22 @@ inline XorFilter build_xor(std::vector<std::uint64_t> keys_in, int rank = 48,
         throw std::invalid_argument("build_xor: rank must be in 1..64");
     }
     std::vector<std::uint64_t> keys = xor_unique_keys(std::move(keys_in));
+    const std::size_t n0 = keys.size();
     XorFilter f;
     for (int try_i = 0; try_i < max_seed_tries; ++try_i) {
+        if (keys.empty() && n0 > 0) {
+            throw std::runtime_error(
+                "build_xor: peel stalled after MEM-6 freed keys (n=" + std::to_string(n0) +
+                "); regenerate the key vector and call build_xor again");
+        }
         const std::uint64_t seed = base_seed + static_cast<std::uint64_t>(try_i) * 0x9E3779B97F4A7C15ULL;
         if (xor_detail::construct_with_seed(keys, static_cast<std::uint32_t>(rank), seed, f)) {
             return f;
         }
+        // Peel stalled: keys already freed (MEM-6). Next loop iteration throws.
     }
     throw std::runtime_error("build_xor: peel failed after " + std::to_string(max_seed_tries) +
-                             " seeds (n=" + std::to_string(keys.size()) + ")");
+                             " seeds (n=" + std::to_string(n0) + ")");
 }
 
 inline bool xor_might_contain(const XorFilter& f, std::uint64_t key) {

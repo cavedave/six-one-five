@@ -10,10 +10,18 @@
 
 #include <algorithm>
 #include <cstdint>
-#include <utility>
+#include <cstdlib>
+#include <cstdio>
+#include <cstring>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
+
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 struct XorFilter {
     store615::StoreHeader hdr{};
@@ -54,6 +62,86 @@ inline std::uint64_t key_hash(std::uint64_t key, std::uint64_t seed) {
 struct PeelEntry {
     std::uint64_t hash;
     std::uint32_t index;  // alone cell
+};
+
+// [MEM-7] Peel stack is ~16n bytes (~62–72 GB at campaign N). Keep it in RAM
+// for small builds; for large n write to scratch and mmap for the fingerprint
+// pass so host RSS stays under ~setxor+counts+packed.
+inline constexpr std::size_t kPeelStackDiskThreshold = 50'000'000;  // ~800 MB stack
+
+inline std::string peel_scratch_dir() {
+    if (const char* e = std::getenv("XOR_PEEL_SCRATCH")) {
+        if (e[0] != '\0') return std::string(e);
+    }
+    // Workbench default; tests with n << threshold never need this path.
+    return "/mnt/scratch/iamreddave/615xor";
+}
+
+struct FilePeelStack {
+    std::string path;
+    int fd = -1;
+    std::size_t count = 0;
+    PeelEntry* map = nullptr;
+    std::size_t map_bytes = 0;
+
+    void create(const std::string& dir) {
+        path = dir + "/xor_peel_" + std::to_string(static_cast<long long>(::getpid())) + ".stk";
+        fd = ::open(path.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0600);
+        if (fd < 0) {
+            throw std::runtime_error("MEM-7: cannot create peel stack file " + path +
+                                     " (set XOR_PEEL_SCRATCH?)");
+        }
+    }
+
+    void push(const PeelEntry& e) {
+        if (::write(fd, &e, sizeof(e)) != (ssize_t)sizeof(e)) {
+            throw std::runtime_error("MEM-7: short write to peel stack " + path);
+        }
+        ++count;
+        // Drop page cache for older stack bytes so RSS does not track the full
+        // ~70 GB file while setxor/counts are still live (Linux).
+#if defined(__linux__)
+        constexpr std::size_t kChunk = (64ull << 20) / sizeof(PeelEntry);  // 64 MiB
+        if (count >= kChunk && (count % kChunk) == 0) {
+            const off_t end = (off_t)(count * sizeof(PeelEntry));
+            const off_t begin = end - (off_t)(kChunk * sizeof(PeelEntry));
+            ::posix_fadvise(fd, begin, end - begin, POSIX_FADV_DONTNEED);
+        }
+#endif
+    }
+
+    void mmap_readonly() {
+        map_bytes = count * sizeof(PeelEntry);
+        if (map_bytes == 0) return;
+        if (::lseek(fd, 0, SEEK_SET) < 0) {
+            throw std::runtime_error("MEM-7: lseek peel stack failed");
+        }
+        void* p = ::mmap(nullptr, map_bytes, PROT_READ, MAP_PRIVATE, fd, 0);
+        if (p == MAP_FAILED) {
+            throw std::runtime_error("MEM-7: mmap peel stack failed");
+        }
+        map = static_cast<PeelEntry*>(p);
+    }
+
+    const PeelEntry& at(std::size_t i) const { return map[i]; }
+
+    void close_unlink() {
+        if (map && map_bytes) {
+            ::munmap(map, map_bytes);
+            map = nullptr;
+            map_bytes = 0;
+        }
+        if (fd >= 0) {
+            ::close(fd);
+            fd = -1;
+        }
+        if (!path.empty()) {
+            ::unlink(path.c_str());
+            path.clear();
+        }
+    }
+
+    ~FilePeelStack() { close_unlink(); }
 };
 
 inline std::size_t capacity_for(std::size_t n) {
@@ -122,10 +210,22 @@ inline bool construct_with_seed(std::vector<std::uint64_t>& keys, std::uint32_t 
     // [MEM-6] Drop keys before stack/queue (~8n). Peel uses only setxor/counts.
     { std::vector<std::uint64_t>().swap(keys); }
 
-    std::vector<PeelEntry> stack;
-    stack.reserve(n);
+    const bool disk_stack = (n >= kPeelStackDiskThreshold);
+    std::vector<PeelEntry> ram_stack;
+    FilePeelStack file_stack;
+    if (disk_stack) {
+        const std::string dir = peel_scratch_dir();
+        std::fprintf(stderr,
+                     "[xor] MEM-7: peel stack on disk (~%.1f GB) under %s\n",
+                     (n * sizeof(PeelEntry)) / 1e9, dir.c_str());
+        file_stack.create(dir);
+    } else {
+        ram_stack.reserve(n);
+    }
+
+    // Do not reserve full array_len for the queue (~4*m bytes ≈ 22 GB at N=95k).
     std::vector<std::uint32_t> queue;
-    queue.reserve(array_len);
+    queue.reserve(std::min(array_len, n + (n >> 3) + 4096));
     for (std::uint32_t i = 0; i < array_len; ++i) {
         if (counts[i] == 1) queue.push_back(i);
     }
@@ -137,7 +237,9 @@ inline bool construct_with_seed(std::vector<std::uint64_t>& keys, std::uint32_t 
         const std::uint64_t h = setxor[i];
         std::uint32_t hs[3];
         hashes(h, block, hs);
-        stack.push_back(PeelEntry{h, i});
+        const PeelEntry ent{h, i};
+        if (disk_stack) file_stack.push(ent);
+        else ram_stack.push_back(ent);
         for (int t = 0; t < 3; ++t) {
             const std::uint32_t j = hs[t];
             setxor[j] ^= h;
@@ -148,12 +250,18 @@ inline bool construct_with_seed(std::vector<std::uint64_t>& keys, std::uint32_t 
         }
     }
 
-    if (stack.size() != n) return false;  // peel stalled; keys already freed (MEM-6)
+    const std::size_t stack_n = disk_stack ? file_stack.count : ram_stack.size();
+    if (stack_n != n) {
+        if (disk_stack) file_stack.close_unlink();
+        return false;  // peel stalled; keys already freed (MEM-6)
+    }
 
     // Free the peel scratch we no longer need before allocating the output.
     { std::vector<std::uint64_t>().swap(setxor); }
     { std::vector<std::uint16_t>().swap(counts); }
     { std::vector<std::uint32_t>().swap(queue); }
+
+    if (disk_stack) file_stack.mmap_readonly();
 
     // [MEM-4] Assign fingerprints directly into the bit-packed buffer. The old
     // code staged them in a u64 array the same length as the output (8 bytes
@@ -162,8 +270,8 @@ inline bool construct_with_seed(std::vector<std::uint64_t>& keys, std::uint32_t 
     const std::uint64_t mask = xor_fp_mask(r);
     out.packed.assign(xor_packed_bytes(array_len, r), 0);
 
-    for (std::size_t k = stack.size(); k-- > 0;) {
-        const PeelEntry& e = stack[k];
+    for (std::size_t k = stack_n; k-- > 0;) {
+        const PeelEntry& e = disk_stack ? file_stack.at(k) : ram_stack[k];
         std::uint32_t hs[3];
         hashes(e.hash, block, hs);
         std::uint64_t xorv = fingerprint(e.hash, r);
@@ -172,6 +280,8 @@ inline bool construct_with_seed(std::vector<std::uint64_t>& keys, std::uint32_t 
         }
         xor_store_cell(out.packed.data(), e.index, r, xorv & mask);
     }
+
+    if (disk_stack) file_stack.close_unlink();
 
     out.hdr.magic = store615::kMagic;
     out.hdr.version = store615::kVersion;

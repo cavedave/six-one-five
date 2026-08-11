@@ -121,9 +121,9 @@ free disk when saving; delete the previous `.bin` if space is tight.
 | Target \(B_{\max}\) | \(N\) | Packed `.bin` | Free disk (save) | Lean build peak RAM | Fits 102 GB GPU? |
 |---:|---:|---:|---:|---:|:---:|
 | 3.5M | 83333 | ~26 GB | ~31 GB | ~132 GB | yes |
-| 4.0M | 95238 | ~34 GB | ~40 GB | ~170 GB | yes |
+| 4.0M | 95238 | ~34 GB | ~40 GB | ~**135 GB** (MEM-5) | yes |
 | 4.5M | 107142 | ~42 GB | ~47 GB | ~220 GB | yes |
-| **5.0M** | 119047 | ~**52 GB** | ~**60 GB** | ~**145 GB** | yes |
+| **5.0M** | 119047 | ~**52 GB** | ~**60 GB** | ~**145 GB** (MEM-5) | yes |
 | 5.04M (soft cap) | 120000 | ~53 GB | ~60 GB | ~146 GB | yes |
 | **10M** | ~238095 | ~**210 GB** | — | ~**575 GB** | **no** |
 

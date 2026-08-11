@@ -53,7 +53,6 @@ struct PairRecover {
 // Host FPR smoke test for a loaded packed xor (should be ~0 hits in 200k random keys at r=48).
 inline int xor_fpr_smoke(const XorFilter& f, int trials = 200000) {
   if (f.packed.empty() || f.hdr.m_cells < 3 || f.hdr.r == 0) return -1;
-  const fc_xor_u32 block = (fc_xor_u32)(f.hdr.m_cells / 3);
   int hits = 0;
   fc_xor_u64 x = 0x123456789abcdef0ULL;
   for (int t = 0; t < trials; ++t) {

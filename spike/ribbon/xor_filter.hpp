@@ -49,13 +49,14 @@ inline std::uint64_t fingerprint(std::uint64_t hash, std::uint32_t r) {
 }
 
 // Map hash -> three cell indices in [0, 3*block).
-inline void hashes(std::uint64_t hash, std::uint32_t block, std::uint32_t out[3]) {
+// Indices are u64: for large N, m=3*block exceeds 2^32 (N≳83600 for pair keys).
+inline void hashes(std::uint64_t hash, std::uint64_t block, std::uint64_t out[3]) {
     const std::uint64_t h0 = hash;
     const std::uint64_t h1 = mix64(hash ^ 0x9E3779B97F4A7C15ULL);
     const std::uint64_t h2 = mix64(hash ^ 0xBF58476D1CE4E5B9ULL);
-    out[0] = static_cast<std::uint32_t>(h0 % block);
-    out[1] = static_cast<std::uint32_t>(h1 % block) + block;
-    out[2] = static_cast<std::uint32_t>(h2 % block) + 2u * block;
+    out[0] = (h0 % block);
+    out[1] = (h1 % block) + block;
+    out[2] = (h2 % block) + 2ull * block;
 }
 
 inline std::uint64_t key_hash(std::uint64_t key, std::uint64_t seed) {
@@ -64,8 +65,9 @@ inline std::uint64_t key_hash(std::uint64_t key, std::uint64_t seed) {
 
 struct PeelEntry {
     std::uint64_t hash;
-    std::uint32_t index;  // alone cell
+    std::uint64_t index;  // alone cell (u64: m can exceed 2^32)
 };
+static_assert(sizeof(PeelEntry) == 16, "PeelEntry must stay 16 bytes for disk stack");
 
 // [MEM-7c] Peel stack ~16n bytes. For large n: buffered write()+fadvise (never
 // mmap the full stack). Fingerprint uses reverse pread chunks so peak stays
@@ -269,7 +271,12 @@ inline bool construct_with_seed(std::vector<std::uint64_t>& keys, std::uint32_t 
     }
 
     const std::size_t array_len = capacity_for(n);
-    const std::uint32_t block = static_cast<std::uint32_t>(array_len / 3);
+    const std::uint64_t block = static_cast<std::uint64_t>(array_len / 3);
+    if (array_len > (std::size_t)UINT32_MAX) {
+        std::fprintf(stderr,
+                     "[xor] IDX-64: m_cells=%zu (>2^32) — using u64 cell indices\n",
+                     array_len);
+    }
     const bool spill_keys = (n >= kPeelStackDiskThreshold);
 
     log_vm_rss("after-unique-keys");
@@ -301,7 +308,7 @@ inline bool construct_with_seed(std::vector<std::uint64_t>& keys, std::uint32_t 
             }
             for (std::size_t i = 0; i < want; ++i) {
                 const std::uint64_t h = key_hash(buf[i], seed);
-                std::uint32_t hs[3];
+                std::uint64_t hs[3];
                 hashes(h, block, hs);
                 for (int t = 0; t < 3; ++t) {
                     setxor[hs[t]] ^= h;
@@ -318,7 +325,7 @@ inline bool construct_with_seed(std::vector<std::uint64_t>& keys, std::uint32_t 
     } else {
         for (std::size_t i = 0; i < n; ++i) {
             const std::uint64_t h = key_hash(keys[i], seed);
-            std::uint32_t hs[3];
+            std::uint64_t hs[3];
             hashes(h, block, hs);
             for (int t = 0; t < 3; ++t) {
                 setxor[hs[t]] ^= h;
@@ -347,24 +354,25 @@ inline bool construct_with_seed(std::vector<std::uint64_t>& keys, std::uint32_t 
     }
 
     // Small starting queue; grows as needed (avoid a 20 GB reserve).
-    std::vector<std::uint32_t> queue;
+    // u64 indices: a uint32 loop here infinite-loops when array_len > 2^32.
+    std::vector<std::uint64_t> queue;
     queue.reserve(1 << 20);
-    for (std::uint32_t i = 0; i < array_len; ++i) {
-        if (counts[i] == 1) queue.push_back(i);
+    for (std::size_t i = 0; i < array_len; ++i) {
+        if (counts[i] == 1) queue.push_back(static_cast<std::uint64_t>(i));
     }
 
     std::size_t qhead = 0;
     while (qhead < queue.size()) {
-        const std::uint32_t i = queue[qhead++];
+        const std::uint64_t i = queue[qhead++];
         if (counts[i] != 1) continue;
         const std::uint64_t h = setxor[i];
-        std::uint32_t hs[3];
+        std::uint64_t hs[3];
         hashes(h, block, hs);
         const PeelEntry ent{h, i};
         if (disk_stack) file_stack.push(ent);
         else ram_stack.push_back(ent);
         for (int t = 0; t < 3; ++t) {
-            const std::uint32_t j = hs[t];
+            const std::uint64_t j = hs[t];
             setxor[j] ^= h;
             if (counts[j] > 0) {
                 counts[j] -= 1;
@@ -381,7 +389,7 @@ inline bool construct_with_seed(std::vector<std::uint64_t>& keys, std::uint32_t 
 
     { std::vector<std::uint64_t>().swap(setxor); }
     { std::vector<std::uint16_t>().swap(counts); }
-    { std::vector<std::uint32_t>().swap(queue); }
+    { std::vector<std::uint64_t>().swap(queue); }
     release_heap_to_os();
     log_vm_rss("after-peel-frees");
 
@@ -394,7 +402,7 @@ inline bool construct_with_seed(std::vector<std::uint64_t>& keys, std::uint32_t 
 
     for (std::size_t k = stack_n; k-- > 0;) {
         const PeelEntry& e = disk_stack ? file_stack.at(k) : ram_stack[k];
-        std::uint32_t hs[3];
+        std::uint64_t hs[3];
         hashes(e.hash, block, hs);
         std::uint64_t xorv = fingerprint(e.hash, r);
         for (int t = 0; t < 3; ++t) {
@@ -464,9 +472,9 @@ inline XorFilter build_xor(std::vector<std::uint64_t> keys_in, int rank = 48,
 inline bool xor_might_contain(const XorFilter& f, std::uint64_t key) {
     if (f.hdr.n_keys == 0) return false;
     if (f.packed.empty() || f.hdr.m_cells < 3) return false;
-    const std::uint32_t block = static_cast<std::uint32_t>(f.hdr.m_cells / 3);
+    const std::uint64_t block = f.hdr.m_cells / 3;
     const std::uint64_t h = xor_detail::key_hash(key, f.hdr.mix_seed);
-    std::uint32_t hs[3];
+    std::uint64_t hs[3];
     xor_detail::hashes(h, block, hs);
     const std::uint64_t got = xor_load_cell(f.packed.data(), hs[0], f.hdr.r) ^
                               xor_load_cell(f.packed.data(), hs[1], f.hdr.r) ^

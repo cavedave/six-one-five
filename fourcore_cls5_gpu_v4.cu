@@ -319,21 +319,21 @@ __device__ __forceinline__ void gate_load_sh(GateSh& gs, const GateData* gd) {
   __syncthreads();
 }
 
-__device__ __forceinline__ bool d_xor_might_contain(const uint8_t* packed, u32 block,
+__device__ __forceinline__ bool d_xor_might_contain(const uint8_t* packed, u64 block,
                                                      u32 r, u64 seed, u64 key) {
   if (block == 0) return false;
   const u64 h = mix64_seeded(key, seed);
   const u64 h1 = mix64(h ^ 0x9E3779B97F4A7C15ULL);
   const u64 h2 = mix64(h ^ 0xBF58476D1CE4E5B9ULL);
-  const u32 i0 = (u32)(h % block);
-  const u32 i1 = (u32)(h1 % block) + block;
-  const u32 i2 = (u32)(h2 % block) + 2u * block;
+  const u64 i0 = (h % block);
+  const u64 i1 = (h1 % block) + block;
+  const u64 i2 = (h2 % block) + 2ull * block;
   const u64 got = xor_load_cell(packed, i0, r) ^ xor_load_cell(packed, i1, r) ^
                   xor_load_cell(packed, i2, r);
   return got == (h & xor_fp_mask(r));
 }
 
-__device__ int d_probe(const uint8_t* packed, u32 block, u32 r, u64 seed, u64 fp, u32 lim,
+__device__ int d_probe(const uint8_t* packed, u64 block, u32 r, u64 seed, u64 fp, u32 lim,
                        u32 unit, u32 d, u32 e,
                        Hit* hits, u32* nhit, u32 hit_cap) {
   (void)lim;  // host filters a,b <= lim after PairRecover
@@ -351,7 +351,7 @@ struct Unit5D {
 };
 
 __global__ void k_cls5_192(const Unit5D* __restrict__ units, int n_units,
-                           const uint8_t* __restrict__ xor_cells, u32 xor_block, u32 xor_r, u64 xor_seed,
+                           const uint8_t* __restrict__ xor_cells, u64 xor_block, u32 xor_r, u64 xor_seed,
                            const GateData* __restrict__ gd, int use_gate,
                            u64 inv216, u64 c_m504, u64 c_m247, u64 inv42_247,
                            Hit* __restrict__ hits, u32* __restrict__ nhit, u32 hit_cap,
@@ -434,7 +434,7 @@ static void run_cls5_gpu(const std::vector<Unit5>& units, int N, int xor_r, XorF
     }
   }
   CU(cudaMemcpy(d_xor, xf.packed.data(), need_bytes, cudaMemcpyHostToDevice));
-  const u32 xor_block = xf.hdr.m_cells ? (u32)(xf.hdr.m_cells / 3) : 0;
+  const u64 xor_block = xf.hdr.m_cells ? (xf.hdr.m_cells / 3) : 0;
   const u32 xor_r_u = xf.hdr.r;
   const u64 xor_seed = xf.hdr.mix_seed;
   decltype(xf.packed)().swap(xf.packed);

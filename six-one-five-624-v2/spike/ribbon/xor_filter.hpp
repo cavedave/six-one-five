@@ -23,6 +23,10 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#if defined(__linux__)
+#include <malloc.h>
+#endif
+
 struct XorFilter {
     store615::StoreHeader hdr{};
     std::vector<std::uint8_t> packed;  // bit-packed fingerprints + 8-byte pad
@@ -174,11 +178,58 @@ inline void pack_from_cells(XorFilter& out, const std::vector<std::uint64_t>& ce
         xor_store_cell(out.packed.data(), i, r, cells[i]);
 }
 
-// [MEM-5]/MEM-6] Keys are only needed for the incidence loop.
-// MEM-6: free them *before* allocating the peel stack (~8n bytes, e.g. ~36 GB
-// at N=95238). That cuts the peak that OOMs at ~230 GB on a 283 GB host.
-// On peel failure keys are already gone — build_xor cannot retry in-place and
-// must regenerate the key vector (rare with load factor 1.23).
+inline void log_vm_rss(const char* tag) {
+#if defined(__linux__)
+    std::FILE* f = std::fopen("/proc/self/status", "r");
+    if (!f) return;
+    char line[256];
+    while (std::fgets(line, sizeof line, f)) {
+        long kb = 0;
+        if (std::sscanf(line, "VmRSS: %ld", &kb) == 1) {
+            std::fprintf(stderr, "[xor] RSS %-20s %6.1f GB\n", tag, kb / (1024.0 * 1024.0));
+            break;
+        }
+    }
+    std::fclose(f);
+#else
+    (void)tag;
+#endif
+}
+
+inline void release_heap_to_os() {
+#if defined(__linux__)
+    ::malloc_trim(0);
+#endif
+}
+
+// Spill key vector to scratch, free RAM, return path. Caller deletes file.
+inline std::string spill_keys_to_scratch(std::vector<std::uint64_t>& keys) {
+    const std::string dir = peel_scratch_dir();
+    const std::string path =
+        dir + "/xor_keys_" + std::to_string(static_cast<long long>(::getpid())) + ".bin";
+    std::FILE* fp = std::fopen(path.c_str(), "wb");
+    if (!fp) {
+        throw std::runtime_error("MEM-8: cannot write key spill " + path +
+                                 " (set XOR_PEEL_SCRATCH?)");
+    }
+    const std::size_t n = keys.size();
+    if (n && std::fwrite(keys.data(), sizeof(std::uint64_t), n, fp) != n) {
+        std::fclose(fp);
+        ::unlink(path.c_str());
+        throw std::runtime_error("MEM-8: short write key spill");
+    }
+    std::fclose(fp);
+    { std::vector<std::uint64_t>().swap(keys); }
+    release_heap_to_os();
+    std::fprintf(stderr, "[xor] MEM-8: spilled %zu keys (%.1f GB) to %s\n", n,
+                 (n * sizeof(std::uint64_t)) / 1e9, path.c_str());
+    return path;
+}
+
+// [MEM-5/6/8] Keys only for incidence. For large n: spill keys to scratch (MEM-8)
+// before allocating setxor/counts so those never overlap the ~36 GB key buffer.
+// MEM-6: keys gone before peel stack. MEM-7: peel stack on mmap+DONTNEED.
+// On peel failure keys are already gone — build_xor regenerates (rare).
 inline bool construct_with_seed(std::vector<std::uint64_t>& keys, std::uint32_t r,
                                 std::uint64_t seed, XorFilter& out) {
     const std::size_t n = keys.size();
@@ -198,28 +249,68 @@ inline bool construct_with_seed(std::vector<std::uint64_t>& keys, std::uint32_t 
 
     const std::size_t array_len = capacity_for(n);
     const std::uint32_t block = static_cast<std::uint32_t>(array_len / 3);
+    const bool spill_keys = (n >= kPeelStackDiskThreshold);
 
-    std::vector<std::uint64_t> setxor(array_len, 0);
-    // [MEM-3] u16 instead of u32. Incidence counts are Poisson with mean 3/1.23
-    // ~ 2.4; 65535 is unreachable for any realistic key set, but guard anyway
-    // rather than wrap silently.
-    std::vector<std::uint16_t> counts(array_len, 0);
-    // [MEM-1] hashes_v deleted — it was write-only.
+    log_vm_rss("after-unique-keys");
 
-    for (std::size_t i = 0; i < n; ++i) {
-        const std::uint64_t h = key_hash(keys[i], seed);
-        std::uint32_t hs[3];
-        hashes(h, block, hs);
-        for (int t = 0; t < 3; ++t) {
-            setxor[hs[t]] ^= h;
-            if (counts[hs[t]] == 0xffffu)
-                throw std::runtime_error("build_xor: cell incidence count overflowed u16");
-            counts[hs[t]] += 1;
-        }
+    std::string key_path;
+    if (spill_keys) {
+        key_path = spill_keys_to_scratch(keys);
+        log_vm_rss("after-key-spill");
     }
 
-    // [MEM-6] Drop keys before stack/queue (~8n). Peel uses only setxor/counts.
-    { std::vector<std::uint64_t>().swap(keys); }
+    std::vector<std::uint64_t> setxor(array_len, 0);
+    // [MEM-3] u16 instead of u32.
+    std::vector<std::uint16_t> counts(array_len, 0);
+    log_vm_rss("after-setxor-counts");
+
+    if (spill_keys) {
+        std::FILE* fp = std::fopen(key_path.c_str(), "rb");
+        if (!fp) {
+            throw std::runtime_error("MEM-8: cannot re-read key spill " + key_path);
+        }
+        constexpr std::size_t kBuf = 1 << 20;  // 1M keys ~8 MB
+        std::vector<std::uint64_t> buf(kBuf);
+        std::size_t seen = 0;
+        while (seen < n) {
+            const std::size_t want = std::min(kBuf, n - seen);
+            if (std::fread(buf.data(), sizeof(std::uint64_t), want, fp) != want) {
+                std::fclose(fp);
+                throw std::runtime_error("MEM-8: short read key spill");
+            }
+            for (std::size_t i = 0; i < want; ++i) {
+                const std::uint64_t h = key_hash(buf[i], seed);
+                std::uint32_t hs[3];
+                hashes(h, block, hs);
+                for (int t = 0; t < 3; ++t) {
+                    setxor[hs[t]] ^= h;
+                    if (counts[hs[t]] == 0xffffu)
+                        throw std::runtime_error("build_xor: cell incidence count overflowed u16");
+                    counts[hs[t]] += 1;
+                }
+            }
+            seen += want;
+        }
+        std::fclose(fp);
+        ::unlink(key_path.c_str());
+        key_path.clear();
+    } else {
+        for (std::size_t i = 0; i < n; ++i) {
+            const std::uint64_t h = key_hash(keys[i], seed);
+            std::uint32_t hs[3];
+            hashes(h, block, hs);
+            for (int t = 0; t < 3; ++t) {
+                setxor[hs[t]] ^= h;
+                if (counts[hs[t]] == 0xffffu)
+                    throw std::runtime_error("build_xor: cell incidence count overflowed u16");
+                counts[hs[t]] += 1;
+            }
+        }
+        { std::vector<std::uint64_t>().swap(keys); }
+        release_heap_to_os();
+    }
+
+    log_vm_rss("after-incidence");
 
     const bool disk_stack = (n >= kPeelStackDiskThreshold);
     std::vector<PeelEntry> ram_stack;
@@ -234,9 +325,9 @@ inline bool construct_with_seed(std::vector<std::uint64_t>& keys, std::uint32_t 
         ram_stack.reserve(n);
     }
 
-    // Do not reserve full array_len for the queue (~4*m bytes ≈ 22 GB at N=95k).
+    // Small starting queue; grows as needed (avoid a 20 GB reserve).
     std::vector<std::uint32_t> queue;
-    queue.reserve(std::min(array_len, n + (n >> 3) + 4096));
+    queue.reserve(1 << 20);
     for (std::uint32_t i = 0; i < array_len; ++i) {
         if (counts[i] == 1) queue.push_back(i);
     }
@@ -264,22 +355,20 @@ inline bool construct_with_seed(std::vector<std::uint64_t>& keys, std::uint32_t 
     const std::size_t stack_n = disk_stack ? file_stack.count : ram_stack.size();
     if (stack_n != n) {
         if (disk_stack) file_stack.close_unlink();
-        return false;  // peel stalled; keys already freed (MEM-6)
+        return false;
     }
 
-    // Free the peel scratch we no longer need before allocating the output.
     { std::vector<std::uint64_t>().swap(setxor); }
     { std::vector<std::uint16_t>().swap(counts); }
     { std::vector<std::uint32_t>().swap(queue); }
+    release_heap_to_os();
+    log_vm_rss("after-peel-frees");
 
     if (disk_stack) file_stack.willneed_all();
 
-    // [MEM-4] Assign fingerprints directly into the bit-packed buffer. The old
-    // code staged them in a u64 array the same length as the output (8 bytes
-    // per cell instead of r/8) and packed afterwards. Reading a neighbour cell
-    // through xor_load_cell is exact, so the result is identical.
     const std::uint64_t mask = xor_fp_mask(r);
     out.packed.assign(xor_packed_bytes(array_len, r), 0);
+    log_vm_rss("after-packed-alloc");
 
     for (std::size_t k = stack_n; k-- > 0;) {
         const PeelEntry& e = disk_stack ? file_stack.at(k) : ram_stack[k];
@@ -293,6 +382,7 @@ inline bool construct_with_seed(std::vector<std::uint64_t>& keys, std::uint32_t 
     }
 
     if (disk_stack) file_stack.close_unlink();
+    log_vm_rss("done-construct");
 
     out.hdr.magic = store615::kMagic;
     out.hdr.version = store615::kVersion;
@@ -306,8 +396,8 @@ inline bool construct_with_seed(std::vector<std::uint64_t>& keys, std::uint32_t 
     out.hdr.shard_count = 1;
     out.hdr.shard_index = 0;
     out.hdr.shard_mode = static_cast<std::uint32_t>(store615::ShardMode::KeyModS);
-    out.hdr.reserved = 0;  // packed layout (version >= 2)
-    return true;  // [MEM-4] packed was filled in place above
+    out.hdr.reserved = 0;
+    return true;
 }
 
 }  // namespace xor_detail

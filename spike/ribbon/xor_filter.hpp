@@ -64,63 +64,72 @@ struct PeelEntry {
     std::uint32_t index;  // alone cell
 };
 
-// [MEM-7] Peel stack is ~16n bytes (~62–72 GB at campaign N). Keep it in RAM
-// for small builds; for large n write to scratch and mmap for the fingerprint
-// pass so host RSS stays under ~setxor+counts+packed.
+// [MEM-7] Peel stack is ~16n bytes (~62–72 GB at campaign N). Keep it in RAM for
+// small builds. For large n: pre-size a scratch file, MAP_SHARED, and
+// MADV_DONTNEED older pages during peel so page cache does not pin ~70 GB while
+// setxor/counts are still live (that was the MEM-7 v1 bad_alloc at ~200 GiB).
 inline constexpr std::size_t kPeelStackDiskThreshold = 50'000'000;  // ~800 MB stack
 
 inline std::string peel_scratch_dir() {
     if (const char* e = std::getenv("XOR_PEEL_SCRATCH")) {
         if (e[0] != '\0') return std::string(e);
     }
-    // Workbench default; tests with n << threshold never need this path.
     return "/mnt/scratch/iamreddave/615xor";
 }
 
 struct FilePeelStack {
     std::string path;
     int fd = -1;
+    std::size_t capacity = 0;
     std::size_t count = 0;
     PeelEntry* map = nullptr;
     std::size_t map_bytes = 0;
 
-    void create(const std::string& dir) {
+    void create(const std::string& dir, std::size_t n_max) {
+        capacity = n_max;
+        map_bytes = n_max * sizeof(PeelEntry);
         path = dir + "/xor_peel_" + std::to_string(static_cast<long long>(::getpid())) + ".stk";
         fd = ::open(path.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0600);
         if (fd < 0) {
             throw std::runtime_error("MEM-7: cannot create peel stack file " + path +
                                      " (set XOR_PEEL_SCRATCH?)");
         }
-    }
-
-    void push(const PeelEntry& e) {
-        if (::write(fd, &e, sizeof(e)) != (ssize_t)sizeof(e)) {
-            throw std::runtime_error("MEM-7: short write to peel stack " + path);
+        if (::ftruncate(fd, (off_t)map_bytes) != 0) {
+            throw std::runtime_error("MEM-7: ftruncate peel stack failed (" +
+                                     std::to_string(map_bytes) + " bytes)");
         }
-        ++count;
-        // Drop page cache for older stack bytes so RSS does not track the full
-        // ~70 GB file while setxor/counts are still live (Linux).
-#if defined(__linux__)
-        constexpr std::size_t kChunk = (64ull << 20) / sizeof(PeelEntry);  // 64 MiB
-        if (count >= kChunk && (count % kChunk) == 0) {
-            const off_t end = (off_t)(count * sizeof(PeelEntry));
-            const off_t begin = end - (off_t)(kChunk * sizeof(PeelEntry));
-            ::posix_fadvise(fd, begin, end - begin, POSIX_FADV_DONTNEED);
-        }
-#endif
-    }
-
-    void mmap_readonly() {
-        map_bytes = count * sizeof(PeelEntry);
-        if (map_bytes == 0) return;
-        if (::lseek(fd, 0, SEEK_SET) < 0) {
-            throw std::runtime_error("MEM-7: lseek peel stack failed");
-        }
-        void* p = ::mmap(nullptr, map_bytes, PROT_READ, MAP_PRIVATE, fd, 0);
+        void* p = ::mmap(nullptr, map_bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
         if (p == MAP_FAILED) {
             throw std::runtime_error("MEM-7: mmap peel stack failed");
         }
         map = static_cast<PeelEntry*>(p);
+    }
+
+    void push(const PeelEntry& e) {
+        if (count >= capacity) {
+            throw std::runtime_error("MEM-7: peel stack overflow");
+        }
+        map[count++] = e;
+        // Evict older pages from RSS (Linux). Keep a small hot tail.
+#if defined(__linux__)
+        constexpr std::size_t kChunk = (64ull << 20) / sizeof(PeelEntry);  // 64 MiB
+        constexpr std::size_t kKeep = (256ull << 20) / sizeof(PeelEntry);  // 256 MiB hot
+        if (count >= kKeep + kChunk && (count % kChunk) == 0) {
+            const std::size_t drop_end = count - kKeep;
+            const std::size_t drop_begin = drop_end - kChunk;
+            ::madvise(reinterpret_cast<char*>(map) + drop_begin * sizeof(PeelEntry),
+                      kChunk * sizeof(PeelEntry), MADV_DONTNEED);
+        }
+#endif
+    }
+
+    // After setxor/counts are freed: fault stack pages back for fingerprinting.
+    void willneed_all() {
+#if defined(__linux__)
+        if (map && count) {
+            ::madvise(map, count * sizeof(PeelEntry), MADV_WILLNEED);
+        }
+#endif
     }
 
     const PeelEntry& at(std::size_t i) const { return map[i]; }
@@ -139,6 +148,8 @@ struct FilePeelStack {
             ::unlink(path.c_str());
             path.clear();
         }
+        capacity = 0;
+        count = 0;
     }
 
     ~FilePeelStack() { close_unlink(); }
@@ -216,9 +227,9 @@ inline bool construct_with_seed(std::vector<std::uint64_t>& keys, std::uint32_t 
     if (disk_stack) {
         const std::string dir = peel_scratch_dir();
         std::fprintf(stderr,
-                     "[xor] MEM-7: peel stack on disk (~%.1f GB) under %s\n",
+                     "[xor] MEM-7: peel stack mmap+DONTNEED (~%.1f GB) under %s\n",
                      (n * sizeof(PeelEntry)) / 1e9, dir.c_str());
-        file_stack.create(dir);
+        file_stack.create(dir, n);
     } else {
         ram_stack.reserve(n);
     }
@@ -261,7 +272,7 @@ inline bool construct_with_seed(std::vector<std::uint64_t>& keys, std::uint32_t 
     { std::vector<std::uint16_t>().swap(counts); }
     { std::vector<std::uint32_t>().swap(queue); }
 
-    if (disk_stack) file_stack.mmap_readonly();
+    if (disk_stack) file_stack.willneed_all();
 
     // [MEM-4] Assign fingerprints directly into the bit-packed buffer. The old
     // code staged them in a u64 array the same length as the output (8 bytes

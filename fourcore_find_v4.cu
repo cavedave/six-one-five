@@ -458,7 +458,7 @@ static void report_solution(const Job& J, u32 a, u32 b, u32 c, u32 d) {
 
 // Run a homogeneous batch (same cls / same kernel). jobs[i] must match mode.
 static u64 run_batch(GpuState& g, const std::vector<Job>& jobs, int mode,
-                     std::vector<u128>* p6 /*nullable, size N+1*/) {
+                     const std::vector<u128>* p6 /*nullable, size N+1*/) {
   if (jobs.empty()) return 0;
   std::vector<Cand> cands;
   cands.reserve(jobs.size());

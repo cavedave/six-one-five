@@ -102,7 +102,7 @@ Eligible \(B\) only (`gcd(B,42)=1`). Bounds are inclusive of the search windows 
 |---|---|---|
 | **All five classes** | **B ≤ 2,353,973** | `solve_516_v3` (i128 ceiling on \(B^6\)) |
 | **cls2–4** | **B ≤ 3,000,000** | post-wall `fourcore_find_v4` (also logged through 2,752,470 as `fc_v3_234_*`) |
-| **cls5** | **B ≤ 4,500,000** | Post-wall **`fourcore_cls5_gpu_v4`** + lean xor (`MEM-1..8`, **IDX-64**) and **`--load-table`**: through 4.0M as before; **4.0→4.5M** done — 0 sols, ~71 min GPU (`units=5158880`, `xor_N107142_r48.bin`). **3.5→4.0M**: ~49 min, `units=4556644`, `xor_N95238_r48.bin`. Next band 4.5→5.0M needs \(N=119047\), ~**52 GB** packed. |
+| **cls5** | **B ≤ 5,000,000** | Post-wall **`fourcore_cls5_gpu_v4`** + lean xor (`MEM-1..8`, **IDX-64**) and **`--load-table`**: **4.5→5.0M** done — 0 sols, ~98 min GPU (`units=5765343`, `xor_N119047_r48.bin`). Prior: 4.0→4.5 (~71 min), 3.5→4.0 (~49 min). Soft single-table cap \(N\le120{,}000\) ≈ **B ≤ 5.04M** — past that needs shards/ribbon. |
 | **cls1** | **B ≤ 3,680,000** | post-wall `fourcore_hunt` + `fourcore_find4` (`D=42`); can push higher than cls2–5 because find4 allows larger \(N\) |
 
 | Item | Value |
@@ -123,13 +123,12 @@ free disk when saving; delete the previous `.bin` if space is tight.
 | 3.5M | 83333 | ~26 GB | ~31 GB | ~132 GB | yes |
 | 4.0M (cleared) | 95238 | **33.41 GB** | ~40 GB | ~**116 GiB** (MEM-7c/8+IDX-64) | yes |
 | 4.5M (cleared) | 107142 | ~42 GB | ~47 GB | ~(est.) 130–150 GiB | yes |
-| **5.0M** | 119047 | ~**52 GB** | ~**60 GB** | ~(est.) 150–180 GiB | yes |
+| **5.0M (cleared)** | 119047 | **~52 GB** | ~60 GB | ~(est.) 150–180 GiB | yes |
 | 5.04M (soft cap) | 120000 | ~53 GB | ~60 GB | ~(est.) ~180 GiB | yes |
 | **10M** | ~238095 | ~**210 GB** | — | ~**575 GB** | **no** |
 
-**Practical disk today:** stepping 4.5→5.0M needs only one table on disk at a
-time if you delete the previous `.bin` after each band clears. Aim for
-~**60 GB free** to build/save the **5 M** table.
+**Practical disk today:** 5 M band is cleared; keep `xor_N119047_r48.bin` only if
+you may re-run, else delete prior `xor_N*.bin` to free scratch. Soft cap next.
 
 **10 M:** a single xor table does **not** fit current hardware (VRAM, host RAM,
 or practical disk). Needs **pair-space shards** and/or **ribbon** (roadmap) —

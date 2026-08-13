@@ -98,6 +98,43 @@ Eligible \(B\) only (`gcd(B,42)=1`). Bounds are inclusive of the search windows 
 > the \((d,e)\) grid on the **host** and is ~**1000× slower** (weeks vs minutes on
 > the same band). `--stream-cls5` is debug/count-only. See `search_density_and_rates.md`.
 
+#### Why class 5 is fast (the ~1000× win)
+
+Cls5 Stage‑1 only emits sparse units `(B,u)`. The combinatorial cost is a
+**2‑D free peel** \((d,e)\). The slow path (`--stream-cls5`) materializes that
+grid on the host (~10¹³ jobs near \(B\sim3\times10^6\)) and feeds tiny find2
+kernels — weeks of wall time. The fast path (`fourcore_cls5_gpu_v4`) keeps a
+packed xor filter of pair sums on the GPU and runs peel → optional residue gate
+→ xor probe in one kernel (`k_cls5_192`), never writing the free grid to host
+jobs. Measured: stream‑cls5 ~10 h for a tiny 2.354→2.36M strip vs cls5‑gpu
+~16 min for 2.36→2.75M; 4.5→5.0M ~98 min GPU. Offline `xor_build_save` +
+`--load-table` amortizes the host table build so search jobs skip peel.
+
+Cls2–4 do **not** get the same win: after one free peel the leaf is still
+find3 (\(a^6+b^6+c^6\)), not a single probe. Deep dive:
+[`cls5_gpu_peel_explained.md`](cls5_gpu_peel_explained.md); rates:
+[`search_density_and_rates.md`](search_density_and_rates.md).
+
+#### When this trick transfers (other Euler sums)
+
+The speedup is a **search shape**, not “cls5” by name. A plan admits a
+cls5‑class fused peel+probe win when:
+
+| # | Property |
+|---|----------|
+| P1 | After peels, residual is a **2‑sum** of \(k\)th powers (find2 leaf) |
+| P2 | **≥2** free peel indices (product grid) |
+| P3 | Leaf is **O(1)** membership in a prebuilt pair store (no nested find3/find4) |
+| P4 | Exact reduction `pair = (… − peels − unit) / S` for fixed scale \(S\) |
+| P5 | Fingerprint of the reduced target is cheap on device (“funnel”) |
+| P6 | Free‑grid product is huge vs O(1) leaf (host expand would be catastrophic) |
+| P7 | Stage‑1 anchors stay sparse; free terms expand only on device |
+
+Composite: **P1 ∧ P2 ∧ P3 ∧ P4 ∧ P6** (P5/P7 strengthen). From an LPS form
+`(k,m,n)` you can **enumerate role partitions** and score these predicates;
+inventing modular Meyrignac **classes** still needs number theory / a catalog.
+Prototype scorer: [`tools/euler_peel_score.py`](tools/euler_peel_score.py).
+
 | Branch | Cleared through | Notes |
 |---|---|---|
 | **All five classes** | **B ≤ 2,353,973** | `solve_516_v3` (i128 ceiling on \(B^6\)) |

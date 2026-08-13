@@ -76,8 +76,8 @@ solve_616_v1: solve_616_v1.cu mod60.hpp quad_sum.hpp k14_common.hpp
 
 v617: solve_617_v1
 
-solve_617_v1: solve_617_v1.cu mod60.hpp quad_sum.hpp k14_common.hpp
-	$(NVCC) $(NVCCFLAGS) -o $@ $<
+solve_617_v1: solve_617_v1.cu mod60.hpp quad_sum.hpp k14_common.hpp $(FOURCORE_V4_DEPS)
+	$(NVCC) $(NVCCFLAGS) -I. -o $@ $<
 
 v2: solve_516_v2
 

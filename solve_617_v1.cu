@@ -80,13 +80,14 @@
 //   target: [100000, 130000] (inside their range: any "solution" there is a bug).
 //
 // Build:
-//   nvcc -O3 -std=c++17 -gencode arch=compute_90,code=compute_90 -o solve_617_v1 solve_617_v1.cu -lineinfo
+//   make v617
 // Host-only:
-//   g++ -O2 -std=c++17 -DHOST_ONLY -fopenmp -o solve_617_host solve_617_v1.cu && ./solve_617_host
+//   g++ -O2 -std=c++17 -DHOST_ONLY -fopenmp -I. -o solve_617_host solve_617_v1.cu && ./solve_617_host
 // Run:
 //   ./solve_617_v1 --selftest
 //   ./solve_617_v1 1 10000 all --check-known          # smoke vs 617-solutions-clean.txt
-//   ./solve_617_v1 400000 425000 all --branch-a-only --chunk 64
+//   ./solve_617_v1 400000 425000 5 --branch-a-only --chunk 64 \
+//     --load-table runs/xor_N9523_r48.bin             # packed xor (v4 format)
 // New primitives found by Branch A (this project, 07/2026), now in the clean file:
 //   B=400471 (cls5), B=421663 (cls5), B=423601 (cls4) — all 2nd kind, gcd=1
 // =============================================================================
@@ -119,6 +120,8 @@
 #define HAVE_XCHECK 1
 #endif
 
+#include "fourcore_xor_store.hpp"
+
 using u64 = unsigned long long;
 using u32 = unsigned int;
 using u16 = unsigned short;
@@ -141,8 +144,6 @@ static constexpr long long M21 = 85766121LL;  // 21^6  (odd part of 42^6)
 static constexpr long long M42 = 5489031744LL;// 42^6 = 64 * 21^6
 static constexpr int K = 7;
 static constexpr long long B_HARD_MAX = 2353973;   // B^6 < 2^127 (i128 guard)
-static constexpr u64 PHI64 = 0x9E3779B97F4A7C15ULL; // fibonacci hash constant
-
 #ifndef HOST_ONLY
 #define CU(x) do { cudaError_t e_ = (x); if (e_ != cudaSuccess) { \
     fprintf(stderr, "CUDA error '%s' at %s:%d\n", cudaGetErrorString(e_), __FILE__, __LINE__); \
@@ -289,95 +290,10 @@ static bool unit_ok616(long long u, int cls) {
 }
 
 // =============================================================================
-// PAIR TABLE (host build, device query) — identical to v3.
-// Slot: 16 bytes. payload==0 marks empty. payload=(i<<16)|j, i<=j, N<=65535.
+// PAIR STORE — packed xor filter (same layout as fourcore_cls5_gpu_v4 / solve_624_v1).
+// Keys: (i^6+j^6) mod 2^64 for 1<=i<=j<=N. GPU records fp on maybe-hit;
+// host PairRecover expands (a,b) before verification.
 // =============================================================================
-struct Slot { u64 key; u32 payload; u32 pad; };
-
-HD u64 mix64(u64 x) {
-    x ^= x >> 33; x *= 0xff51afd7ed558ccdULL;
-    x ^= x >> 33; x *= 0xc4ceb9fe1a85ec53ULL;
-    x ^= x >> 33; return x;
-}
-HD u64 hash_pos(u64 fp, int S) {
-    return (fp * PHI64) >> (64 - S);
-}
-
-// Build slots for all pairs 1<=i<=j<=N, fp = (i^6+j^6) mod 2^64.
-static void table_build(int N, int S, std::vector<Slot>& slots) {
-    const size_t size = (size_t)1 << S;
-    const double pairs_est = (double)N * (N + 1) / 2;
-    if ((double)size * 0.95 < pairs_est) {   // insert probes need empty slots to terminate
-        fprintf(stderr, "[table] FATAL: load factor %.2f (pairs=%.3e slots=2^%d); increase S\n",
-                pairs_est / (double)size, pairs_est, S);
-        exit(1);
-    }
-    slots.assign(size, Slot{0, 0, 0});
-    std::vector<u64> pw6(N + 1);
-#pragma omp parallel for schedule(static)
-    for (int x = 1; x <= N; ++x) {
-        u64 x2 = (u64)x * x;
-        pw6[x] = x2 * x2 * x2;   // x^6 mod 2^64 (wrapping)
-    }
-    const u64 mask = size - 1;
-    std::atomic<u64> steps{0};
-    const auto t0 = Clock::now();
-#pragma omp parallel for schedule(static)
-    for (int i = 1; i <= N; ++i) {
-        u64 local = 0;
-        for (int j = i; j <= N; ++j) {
-            const u64 fp = pw6[i] + pw6[j];
-            const u32 pld = ((u32)i << 16) | (u32)j;
-            u64 pos = hash_pos(fp, S);
-            const u64 step = mix64(fp) | 1ULL;
-            for (;;) {
-                ++local;
-                if (__sync_bool_compare_and_swap(&slots[pos].payload, 0u, pld)) {
-                    slots[pos].key = fp;
-                    break;
-                }
-                pos = (pos + step) & mask;
-            }
-        }
-        steps += local;
-    }
-    const double ms = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - t0).count();
-    const double P = (double)N * (N + 1) / 2;
-    fprintf(stderr, "[table] N=%d pairs=%.3e slots=2^%d (%.1f GB) LF=%.3f avg insert probes=%.2f build=%.0f ms\n",
-            N, P, S, size * 16.0 / 1e9, P / size, steps.load() / P, ms);
-}
-
-struct TableHeader { char magic[8]; u64 N, S; };
-static void table_save(const char* path, const std::vector<Slot>& slots, int N, int S) {
-    FILE* f = fopen(path, "wb");
-    if (!f) { fprintf(stderr, "[table] cannot open %s for write\n", path); return; }
-    TableHeader h; memcpy(h.magic, "617TBL01", 8); h.N = (u64)N; h.S = (u64)S;
-    fwrite(&h, sizeof(h), 1, f);
-    fwrite(slots.data(), sizeof(Slot), slots.size(), f);
-    fclose(f);
-    fprintf(stderr, "[table] saved to %s (%.1f GB)\n", path, slots.size() * 16.0 / 1e9);
-}
-static bool table_load(const char* path, std::vector<Slot>& slots, int N, int& S) {
-    FILE* f = fopen(path, "rb");
-    if (!f) return false;
-    TableHeader h;
-    if (fread(&h, sizeof(h), 1, f) != 1) { fclose(f); return false; }
-    if (memcmp(h.magic, "617TBL01", 8) != 0 && memcmp(h.magic, "616TBL01", 8) != 0) {
-        fclose(f); fprintf(stderr, "[table] bad file %s\n", path); return false;
-    }
-    if ((int)h.N != N) {
-        fclose(f); fprintf(stderr, "[table] N mismatch: file N=%llu, need %d — rebuilding\n", (unsigned long long)h.N, N);
-        return false;
-    }
-    S = (int)h.S;
-    slots.assign((size_t)1 << S, Slot{0, 0, 0});
-    const size_t want = slots.size() * sizeof(Slot);
-    const size_t got = fread(slots.data(), sizeof(Slot), want, f);
-    fclose(f);
-    if (got != want) { fprintf(stderr, "[table] short read %s\n", path); return false; }
-    fprintf(stderr, "[table] loaded %s (N=%d, 2^%d slots)\n", path, N, S);
-    return true;
-}
 
 // ------------------------------------------------------- probe gate (host) --
 // Pair-sum achievability bitmaps, CRT-factored: x mod 124,488 is achievable
@@ -446,14 +362,18 @@ struct GpuCand {
     u32 res[24];           // 96
 };
 
-struct Hit { u32 cand, a, b, c, d, e; };  // a,b pair; c,d,e = c3,c4,c5 | c3,c4,w'
+struct Hit { u32 cand, a, b, c, d, e; u64 fp; };  // a,b filled on host via PairRecover
+
+#ifndef HOST_ONLY
+#include "fourcore_find_device.cuh"
+#endif
 
 #ifndef HOST_ONLY
 
 struct Params {
-    const Slot* __restrict__ tab;
-    u64 mask;
-    int S;
+    const uint8_t* __restrict__ xor_cells;
+    u32 xor_block, xor_r;
+    u64 xor_seed;
     Hit* __restrict__ hits;
     u32* __restrict__ hitc;
     u32 cap;
@@ -572,21 +492,13 @@ __device__ __forceinline__ bool tri_get(const u64* __restrict__ b, u32 x) {
 }
 
 __device__ u64 probe(const Params& P, u64 fp, u32 ci, u32 v3, u32 v4, u32 v5 = 0) {
-    u64 pos = hash_pos(fp, P.S);
-    const u64 step = mix64(fp) | 1ULL;
-    u64 reads = 0;
-    for (;;) {
-        const Slot s = P.tab[pos];
-        ++reads;
-        if (s.payload == 0) break;
-        if (s.key == fp) {
-            const u32 idx = atomicAdd(P.hitc, 1u);
-            if (idx < P.cap) P.hits[idx] = Hit{ci, s.payload >> 16, s.payload & 0xffffu, v3, v4, v5};
-            else atomicExch(P.overflow, 1u);
-        }
-        pos = (pos + step) & P.mask;
-    }
-    return reads;
+    constexpr u64 kXorReads = 3;
+    if (!fc_d_xor_might_contain(P.xor_cells, P.xor_block, P.xor_r, P.xor_seed, fp))
+        return kXorReads;
+    const u32 idx = atomicAdd(P.hitc, 1u);
+    if (idx < P.cap) P.hits[idx] = Hit{ci, 0, 0, v3, v4, v5, fp};
+    else atomicExch(P.overflow, 1u);
+    return kXorReads;
 }
 
 // ------------------------------------------------------------- kernels --
@@ -715,32 +627,16 @@ __global__ void k_find4_cls5(Params P) {
     if (skip) atomicAdd(P.gated, skip);
 }
 
-// Plant-test kernel: each thread probes fps[t] and verifies that the expected
-// packed payload appears among the matches.
-__global__ void k_probe_test(const u64* fps, const u32* expect, int n,
-                             const Slot* tab, u64 mask, int S, u32* ok, u32* bad) {
-    const int t = blockIdx.x * blockDim.x + threadIdx.x;
-    if (t >= n) return;
-    const u64 fp = fps[t];
-    u64 pos = hash_pos(fp, S);
-    const u64 step = mix64(fp) | 1ULL;
-    bool found = false;
-    for (;;) {
-        const Slot s = tab[pos];
-        if (s.payload == 0) break;
-        if (s.key == fp && s.payload == expect[t]) found = true;
-        pos = (pos + step) & mask;
-    }
-    if (found) atomicAdd(ok, 1u); else atomicAdd(bad, 1u);
-}
-
 // =============================================================================
 // HOST ORCHESTRATION
 // =============================================================================
 struct GpuCtx {
-    Slot* d_tab = nullptr;
-    size_t tab_slots = 0;
-    int S = 0;
+    uint8_t* d_xor = nullptr;
+    size_t xor_bytes = 0;
+    u32 xor_block = 0, xor_r = 48;
+    u64 xor_seed = 0;
+    int table_N = 0;
+    PairRecover pair_ix;
     Hit* d_hits = nullptr;
     u32 hit_cap = 0;
     u32* d_hitc = nullptr;
@@ -786,14 +682,20 @@ static void gpu_init(GpuCtx& g, int device, u32 hit_cap) {
     CU(cudaMalloc(&g.d_probes, sizeof(u64)));
 }
 
-static void gpu_upload_table(GpuCtx& g, const std::vector<Slot>& slots, int S) {
-    g.S = S;
-    g.tab_slots = slots.size();
-    CU(cudaMalloc(&g.d_tab, slots.size() * sizeof(Slot)));
+static void gpu_upload_xor(GpuCtx& g, const XorFilter& xf, int N) {
+    g.xor_block = xf.hdr.m_cells ? (u32)(xf.hdr.m_cells / 3) : 0;
+    g.xor_r = xf.hdr.r;
+    g.xor_seed = xf.hdr.mix_seed;
+    g.xor_bytes = xf.packed.size();
+    g.table_N = N;
+    if (g.d_xor) CU(cudaFree(g.d_xor));
+    CU(cudaMalloc(&g.d_xor, g.xor_bytes));
     const auto t0 = Clock::now();
-    CU(cudaMemcpy(g.d_tab, slots.data(), slots.size() * sizeof(Slot), cudaMemcpyHostToDevice));
+    CU(cudaMemcpy(g.d_xor, xf.packed.data(), g.xor_bytes, cudaMemcpyHostToDevice));
     const double ms = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - t0).count();
-    fprintf(stderr, "[gpu] table uploaded (%.1f GB) in %.0f ms\n", slots.size() * 16.0 / 1e9, ms);
+    g.pair_ix.build(N);
+    fprintf(stderr, "[gpu] xor uploaded %.3f GB r=%u block=%u N=%d in %.0f ms\n",
+            g.xor_bytes / 1e9, g.xor_r, g.xor_block, N, ms);
 }
 
 static void gpu_upload_gate(GpuCtx& g, const GateData& gd) {
@@ -1011,7 +913,7 @@ static RunResult gpu_run(GpuCtx& g, int cls, const std::vector<GpuCand>& v, u64 
     }
 
     Params P{};
-    P.tab = g.d_tab; P.mask = g.tab_slots - 1; P.S = g.S;
+    P.xor_cells = g.d_xor; P.xor_block = g.xor_block; P.xor_r = g.xor_r; P.xor_seed = g.xor_seed;
     P.hits = g.d_hits; P.hitc = g.d_hitc; P.cap = g.hit_cap; P.overflow = g.d_overflow;
     P.probes = g.d_probes;
     P.cands = g.d_cands; P.n_cand = (u32)v.size();
@@ -1073,6 +975,25 @@ static u64 inv216_mod_2_64() {
 }
 
 // ------------------------------------------------------------- verification --
+static void expand_xor_hits(const PairRecover& pr, const std::vector<Hit>& raw, std::vector<Hit>& out) {
+    out.clear();
+    std::vector<std::pair<u32, u32>> pairs;
+    out.reserve(raw.size() * 2);
+    for (const Hit& H : raw) {
+        if (H.fp == 0 && (H.a != 0 || H.b != 0)) {
+            out.push_back(H);
+            continue;
+        }
+        pr.recover(H.fp, pairs);
+        for (const auto& ab : pairs) {
+            Hit e = H;
+            e.a = ab.first;
+            e.b = ab.second;
+            out.push_back(e);
+        }
+    }
+}
+
 // Returns 0 = fingerprint false positive, 1 = exact decomposition but tuple
 // rejected (non-distinct / out of range), 2 = SOLUTION.
 static int verify_hit(const GpuCand& C, const Hit& H, long& solutions,
@@ -1518,49 +1439,40 @@ static bool selftest_host(const RootTables& rt, u64 inv216) {
 // ------------------------------------------------------- GPU plant tests --
 // Build a small table, plant known targets, require the kernels to find them.
 static bool selftest_gpu(GpuCtx& g, u64 inv216) {
-    fprintf(stderr, "[selftest] GPU plant tests (small table N=4096)\n");
-    const int N = 4096, S = 24;   // LF ~0.5: S must satisfy 2^S*0.95 >= N(N+1)/2
-    std::vector<Slot> slots;
-    table_build(N, S, slots);
-    gpu_upload_table(g, slots, S);
+    fprintf(stderr, "[selftest] GPU plant tests (small xor N=4096)\n");
+    const int N = 4096;
+    XorFilter xf = xor_build_pairs(N, 48);
+    gpu_upload_xor(g, xf, N);
     GateData gd;
     build_gate(gd);
     gpu_upload_gate(g, gd);   // plants double as the gate soundness test
 
-    // -- pair plant: 20000 random pairs must all be found by k_probe_test --
+    // -- pair plant: 20000 random pair fps must all xor-hit --
     {
         const int n = 20000;
-        std::vector<u64> fps(n);
-        std::vector<u32> exp(n);
         std::vector<u64> pw6(N + 1);
-        for (int x = 1; x <= N; ++x) { const u64 x2 = (u64)x * x; pw6[x] = x2 * x2 * x2; }
+        for (int x = 1; x <= N; ++x) {
+            const u64 x2 = (u64)x * x;
+            pw6[x] = x2 * x2 * x2;
+        }
+        int ok = 0, bad = 0;
         srand(1234);
         for (int t = 0; t < n; ++t) {
             const int i = 1 + rand() % N, j = i + rand() % (N - i + 1);
-            fps[t] = pw6[i] + pw6[j];
-            exp[t] = ((u32)i << 16) | (u32)j;
+            if (xor_might_contain(xf, pw6[i] + pw6[j])) ++ok;
+            else ++bad;
         }
-        u64 *d_fps; u32 *d_exp, *d_ok, *d_bad;
-        CU(cudaMalloc(&d_fps, n * 8)); CU(cudaMalloc(&d_exp, n * 4));
-        CU(cudaMalloc(&d_ok, 4)); CU(cudaMalloc(&d_bad, 4));
-        CU(cudaMemcpy(d_fps, fps.data(), n * 8, cudaMemcpyHostToDevice));
-        CU(cudaMemcpy(d_exp, exp.data(), n * 4, cudaMemcpyHostToDevice));
-        CU(cudaMemset(d_ok, 0, 4)); CU(cudaMemset(d_bad, 0, 4));
-        k_probe_test<<<(n + 255) / 256, 256>>>(d_fps, d_exp, n, g.d_tab, g.tab_slots - 1, S, d_ok, d_bad);
-        CU(cudaGetLastError()); CU(cudaDeviceSynchronize());
-        u32 ok = 0, bad = 0;
-        CU(cudaMemcpy(&ok, d_ok, 4, cudaMemcpyDeviceToHost));
-        CU(cudaMemcpy(&bad, d_bad, 4, cudaMemcpyDeviceToHost));
-        cudaFree(d_fps); cudaFree(d_exp); cudaFree(d_ok); cudaFree(d_bad);
-        fprintf(stderr, "[plant] pairs: ok=%u bad=%u\n", ok, bad);
+        fprintf(stderr, "[plant] xor pairs: ok=%d bad=%d\n", ok, bad);
         if (bad != 0) return false;
     }
 
     auto run_and_count_exact = [&](int cls, std::vector<GpuCand>& cands,
                                    const std::vector<u128>& targets) -> int {
         RunResult R = gpu_run(g, cls, cands, inv216);
+        std::vector<Hit> expanded;
+        expand_xor_hits(g.pair_ix, R.hits, expanded);
         std::vector<char> got(cands.size(), 0);
-        for (const Hit& H : R.hits) {
+        for (const Hit& H : expanded) {
             if (H.cand >= cands.size()) continue;
             const GpuCand& C = cands[H.cand];
             const u128 a6 = h_pow6_128(H.a), b6 = h_pow6_128(H.b);
@@ -1629,8 +1541,10 @@ static bool selftest_gpu(GpuCtx& g, u64 inv216) {
         auto run_and_count_exact5 = [&](int cls, std::vector<GpuCand>& cands,
                                         const std::vector<u128>& targets) -> int {
             RunResult R = gpu_run(g, cls, cands, inv216);
+            std::vector<Hit> expanded;
+            expand_xor_hits(g.pair_ix, R.hits, expanded);
             std::vector<char> got(cands.size(), 0);
-            for (const Hit& H : R.hits) {
+            for (const Hit& H : expanded) {
                 if (H.cand >= cands.size()) continue;
                 const u128 a6 = h_pow6_128(H.a), b6 = h_pow6_128(H.b);
                 const u128 base = ((u128)cands[H.cand].q_hi << 64) | cands[H.cand].q_lo;
@@ -1732,7 +1646,7 @@ int main(int argc, char** argv) {
     // ---- argument parsing ----
     std::vector<std::string> pos;
     long long chunk = 8192, bench_chunks = 0;
-    int device = 0, slots_log2 = 0;
+    int device = 0, xor_r = 48;
     u32 hit_cap = 1u << 20;
     std::string save_table, load_table;
     bool opt_selftest = false, opt_xcheck = false, quiet = false, opt_nogate = false, opt_notri = false;
@@ -1755,7 +1669,11 @@ int main(int argc, char** argv) {
         else if (a == "--branch-b-lim" && i + 1 < argc) branch_b_lim = atoi(argv[++i]);
         else if (a == "--chunk" && i + 1 < argc) chunk = atoll(argv[++i]);
         else if (a == "--device" && i + 1 < argc) device = atoi(argv[++i]);
-        else if (a == "--slots-log2" && i + 1 < argc) slots_log2 = atoi(argv[++i]);
+        else if (a == "--r" && i + 1 < argc) xor_r = atoi(argv[++i]);
+        else if (a == "--slots-log2") {
+            if (i + 1 < argc && argv[i + 1][0] != '-') ++i;
+            fprintf(stderr, "[617] --slots-log2 ignored (packed xor replaces OA table)\n");
+        }
         else if (a == "--hit-cap" && i + 1 < argc) hit_cap = (u32)atol(argv[++i]);
         else if (a == "--save-table" && i + 1 < argc) save_table = argv[++i];
         else if (a == "--load-table" && i + 1 < argc) load_table = argv[++i];
@@ -1790,8 +1708,10 @@ int main(int argc, char** argv) {
             "  Branch A (2nd kind): 7∤B — GPU Meyrignac cls1-5 (find5/find4)\n"
             "  Branch B (1st kind): 7|B — CPU outer a6,a7 + find5 MITM\n"
             "  classes: \"all\" (default) or e.g. \"1,3\";  u band as fractions of B\n"
-            "  options: --chunk K --device K --slots-log2 S --hit-cap N\n"
+            "  options: --chunk K --device K --r R --hit-cap N\n"
             "           --save-table F --load-table F --bench [K] --xcheck --quiet\n"
+            "  --load-table F: packed xor (xor_build_save / fourcore v4 format; skip host peel).\n"
+            "  --save-table F: write packed xor after build.\n"
             "           --check-known [--known-file F]  diff vs database after run\n"
             "           --branch-a-only / --branch-b-only\n"
             "           --branch-b-lim N  max term for Branch B pair index (default 12000)\n"
@@ -1830,7 +1750,6 @@ int main(int argc, char** argv) {
                 "using CPU fallback for Branch B\n", branch_b_lim, branch_b_lim);
     if (branch_a) {
         if (N < 4) { fprintf(stderr, "B_max too small for Branch A\n"); return 1; }
-        if (N > 65535) { fprintf(stderr, "N=%d exceeds 32-bit payload packing (B<=2.75M)\n", N); return 1; }
     }
 
     GpuCtx g{};
@@ -1851,27 +1770,30 @@ int main(int argc, char** argv) {
         gpu_upload_tri(g, td);
     }
 
-    // ---- table: load or build, then upload ----
-    int S = slots_log2;
-    std::vector<Slot> slots;
+    // ---- xor store: load or build, then upload ----
+    XorFilter xf;
     bool loaded = false;
-    if (!load_table.empty()) loaded = table_load(load_table.c_str(), slots, N, S);
+    if (!load_table.empty()) loaded = xor_load_file(load_table.c_str(), xf, N);
     if (!loaded) {
-        if (S == 0) {                       // smallest pow2 with load factor <= 0.6
-            const double P = (double)N * (N + 1) / 2;
-            S = 20;
-            while ((double)((u64)1 << S) * 0.6 < P) ++S;
-        }
-        const double P = (double)N * (N + 1) / 2;
-        if ((double)((u64)1 << S) * 0.95 < P) {   // probes need empty slots to terminate
-            fprintf(stderr, "slots 2^%d too small for %.3e pairs — raise --slots-log2\n", S, P);
+        if (N > kXorNSoftMax) {
+            fprintf(stderr, "[617] N=%d > soft max %d (~B=%lld) — raise cap or shard\n",
+                    N, kXorNSoftMax, (long long)kXorNSoftMax * 42LL);
             return 1;
         }
-        table_build(N, S, slots);
-        if (!save_table.empty()) table_save(save_table.c_str(), slots, N, S);
+        xf = xor_build_pairs(N, xor_r);
     }
-    gpu_upload_table(g, slots, S);
-    std::vector<Slot>().swap(slots);
+    xor_r = (int)xf.hdr.r;
+    if (!save_table.empty()) xor_save_file(save_table.c_str(), xf);
+    {
+        const int fpr = xor_fpr_smoke(xf);
+        if (fpr > 8) {
+            fprintf(stderr, "[617] FATAL: xor FPR smoke too high (%d) — refuse to search\n", fpr);
+            return 1;
+        }
+    }
+    gpu_upload_xor(g, xf, N);
+    xf.packed.clear();
+    xf.packed.shrink_to_fit();
     }  // branch_a GPU setup
 
     // ---- xcheck mode (Branch A only) ----
@@ -1891,8 +1813,10 @@ int main(int argc, char** argv) {
                 gen_class_cands(rt, B, cls, u_lo, u_hi, cands);
                 if (cands.empty()) continue;
                 RunResult R = gpu_run(g, cls, cands, inv216);
+                std::vector<Hit> expanded;
+                expand_xor_hits(g.pair_ix, R.hits, expanded);
                 std::vector<char> gpu_exact(cands.size(), 0);
-                for (const Hit& H : R.hits) {
+                for (const Hit& H : expanded) {
                     if (H.cand >= cands.size()) continue;
                     long sol_dummy = 0;
                     const int v = verify_hit(cands[H.cand], H, sol_dummy, reported);
@@ -1972,7 +1896,9 @@ int main(int argc, char** argv) {
                 stat_ms[cls] += R.kernel_ms;
                 if (R.overflow)
                     fprintf(stderr, "!! hit buffer overflow at B<=%lld — rerun with larger --hit-cap\n", c1);
-                for (const Hit& H : R.hits) {
+                std::vector<Hit> expanded;
+                expand_xor_hits(g.pair_ix, R.hits, expanded);
+                for (const Hit& H : expanded) {
                     if (H.cand >= batch.size()) continue;
                     const long sol_before = solutions;
                     const int v = verify_hit(batch[H.cand], H, solutions, reported);
@@ -2018,7 +1944,9 @@ int main(int argc, char** argv) {
                         fflush(stderr);
                     }
                     RunResult R = gpu_run(g, 10, gbb, inv216);
-                    for (const Hit& H : R.hits) {
+                    std::vector<Hit> expanded;
+                    expand_xor_hits(g.pair_ix, R.hits, expanded);
+                    for (const Hit& H : expanded) {
                         if (H.cand >= gbb.size()) continue;
                         const long sol_before = solutions;
                         const int v = verify_hit(gbb[H.cand], H, solutions, reported);

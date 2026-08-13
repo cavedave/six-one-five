@@ -115,7 +115,7 @@ On current `solve_617_v1` (no Layer C invention):
 
 | Lever | Idea |
 |-------|------|
-| Packed xor / `--load-table` | If still on fat OA slots, match (6,1,5) v4 packing |
+| Packed xor / `--load-table` | **DONE** in `solve_617_v1` (v4 xor format; replaces 16-byte OA slots) |
 | Probe gate already ~99% kill | Keep; A/B with `--no-gate` |
 | Chunk / host RAM | `--chunk` already; avoid rebuild thrash |
 | Profile cls5 vs cls2–4 | cls5 is ~half of probes/\(B\); optimize that path first |
@@ -127,7 +127,7 @@ On current `solve_617_v1` (no Layer C invention):
 
 1. ~~**Plant spike:**~~ **DONE** — see §8. Deeper find2 **loses** on probe count.
 2. **Do not** sketch `k_cls5_617_find2` on probe-count grounds.
-3. Parallel ~10× track: packed xor / load-table / profile `k_find4_cls5` constants (§5).
+3. Parallel ~10× track: **xor port landed** — profile `k_find4_cls5` on server (§5).
 
 ---
 

@@ -102,7 +102,10 @@ So naive deeper peel **reorganizes** work that find4 already spends walking core
 - Expecting (6,1,5)-style 1000× from “stop materializing jobs” — production 617 cls5 is **already** GPU find4.
 - Ignoring \(\sim N^2\) growth of the two extra free cores.
 
-**Verdict:** deeper find2 is a **plausible ~2–10× engineering bet**, worth a spike kernel + plant of known hits (e.g. \(B=400471\)), not a claimed miracle until benchmarked against `k_find4_cls5`.
+**Verdict:** deeper find2 looked like a **plausible ~2–10× engineering bet** on
+paper; **plant spike (§8) falsified that** — find2 does ~25–30× *more* inner
+probes than find4 on known cls5 hits. Do not build a fused find2 kernel for
+617 cls5 on current evidence.
 
 ---
 
@@ -122,9 +125,9 @@ On current `solve_617_v1` (no Layer C invention):
 
 ## 6. Next build steps (when you want code)
 
-1. **Plant spike:** for known cls5 solution \(B=400471\), run production find4 vs a host-reference deeper find2 count (same peels, compare probe counts).
-2. If find2 probe count ≲ find4 within ~3×, sketch `k_cls5_617_find2` (5-D free, xor leaf) beside `k_find4_cls5`.
-3. Only then overnight strip vs current binary.
+1. ~~**Plant spike:**~~ **DONE** — see §8. Deeper find2 **loses** on probe count.
+2. **Do not** sketch `k_cls5_617_find2` on probe-count grounds.
+3. Parallel ~10× track: packed xor / load-table / profile `k_find4_cls5` constants (§5).
 
 ---
 
@@ -133,6 +136,35 @@ On current `solve_617_v1` (no Layer C invention):
 ```
 production 3FREE+find4     => no          (find4)
 deeper 4FREE+find3         => no          (find3)
-deeper 5FREE+find2         => CLS5_SHAPED (grid ~3e21 raw)
-5FREE+find2 (w' CRT~64)    => CLS5_SHAPED (grid ~5e19 est.)
+deeper 5FREE+find2         => CLS5_SHAPED (shape only — see §8)
+5FREE+find2 (w' CRT~64)    => CLS5_SHAPED
 ```
+
+---
+
+## 8. Plant spike results (empirical)
+
+Script: [`plant_617_cls5_find2.py`](plant_617_cls5_find2.py)
+
+```bash
+python3 tools/plant_617_cls5_find2.py              # this-project solutions
+python3 tools/plant_617_cls5_find2.py --all-2nd    # all 2nd-kind in clean file
+```
+
+Method (regression plants only — **same** Branch A cls5, no new moduli):
+
+- Classify known solutions into \(14u',6v',21w',42c_{1..4}\).
+- Count find4-style \((c_4,c_3)\) **calls** (window mirrored from `k_find4_cls5`).
+- Count deeper find2 probes \(\binom{N+1}{2}\) with \(N=\lfloor(B-1)/42\rfloor\).
+- Optional: ×1.08% gate keep → expected table hits.
+
+| Set | cls5 plants | median find2/find4_calls | min…max |
+|-----|------------:|-------------------------:|---------|
+| This project (7 cls5) | 7 | **34×** | 25× … 223× (\(B=400471\)) |
+| All 2nd-kind clean | 54 | **30×** | 25× … 223× |
+
+Example \(B=400471\): find4_calls \(\approx2.0\times10^5\), find2 \(\approx4.5\times10^7\) → **~223× more** find2 probes. After gate, find4 table work is even smaller → find2 looks **~10⁴×** worse on table traffic.
+
+**VERDICT: drop deeper find2 for (6,1,7) cls5.** The scorers’s `CLS5_SHAPED` means “legal shape,” not “cheaper.” Find4’s tight \((c_4,c_3)\) window already beats enumerating all core pairs. Pursue **~10× on existing find4** (packing, gates, load-table), not a fused find2 rewrite.
+
+Non-cls5 project hits (e.g. \(B=423601\) cls4, \(B=428195\) cls3) were correctly skipped — different leaf shapes.

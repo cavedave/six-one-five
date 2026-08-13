@@ -133,7 +133,9 @@ cls5‑class fused peel+probe win when:
 Composite: **P1 ∧ P2 ∧ P3 ∧ P4 ∧ P6** (P5/P7 strengthen). From an LPS form
 `(k,m,n)` you can **enumerate role partitions** and score these predicates;
 inventing modular Meyrignac **classes** still needs number theory / a catalog.
-Prototype scorer: [`tools/euler_peel_score.py`](tools/euler_peel_score.py).
+Prototype scorer: [`tools/euler_peel_score.py`](tools/euler_peel_score.py)
+(`--demo` for (6,1,5); `--617` for (6,1,7) cls5 peel-depth / Layer C).
+See also [`tools/layer_c_617_cls5.md`](tools/layer_c_617_cls5.md).
 
 | Branch | Cleared through | Notes |
 |---|---|---|

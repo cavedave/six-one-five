@@ -95,3 +95,15 @@ Nothing is auto-written on each run except what you redirect, e.g.:
 python3 tools/euler_peel_score.py --k 6 --m 5 --n 1 --S 42 --top 50 \
   > tools/out_615_plans.txt
 ```
+
+---
+
+## Layer C — (6,1,7) cls5 peel depth
+
+See [`layer_c_617_cls5.md`](layer_c_617_cls5.md). Quick score:
+
+```bash
+python3 tools/euler_peel_score.py --617 --B 4e5
+```
+
+Production Branch A cls5 is **find4** (not cls5_shaped). Deeper peel to **find2** scores cls5_shaped but work is \(\sim N^2\) per \((u',v',w')\) — likely ~2–10× engineering, not 1000×.

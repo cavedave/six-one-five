@@ -251,6 +251,97 @@ def known_controls(B_target: float = 3.0e6) -> List[Tuple[str, SearchPlan]]:
     return [("cls5+", cls5), ("cls2-", cls2), ("cls1-", cls1)]
 
 
+def known_617_cls5_plans(B_target: float = 4.0e5) -> List[Tuple[str, SearchPlan]]:
+    """(6,1,7) Branch A cls5 — production + deeper-peel search strategies.
+
+    Same Meyrignac class (completeness unchanged). Terms are:
+      14·u' (~3), 6·v' (~7), 21·w' (odd), 42·c1..c4 (role-free).
+    Production peels (u',v',w') and leaves find4 on the four 42-cores.
+    Deeper peel treats extra c_i as FREE (dense 1..B/42) — not a new class,
+    only a different peel depth inside cls5.
+    """
+    # A: production solve_617_v1 cls5 — 3 peels + find4
+    prod = SearchPlan(
+        k=6,
+        m=7,
+        n=1,
+        roles=(FREE, FREE, FREE, PAIR, PAIR, PAIR, PAIR),
+        scale_S=42,
+        B_target=B_target,
+        free_scales=(14, 6, 21),  # u', v', w'
+        label="(6,1,7) cls5 production 3FREE+find4",
+    )
+    # B: peel one extra 42-core → find3 leaf
+    find3 = SearchPlan(
+        k=6,
+        m=7,
+        n=1,
+        roles=(FREE, FREE, FREE, FREE, PAIR, PAIR, PAIR),
+        scale_S=42,
+        B_target=B_target,
+        free_scales=(14, 6, 21, 42),
+        label="(6,1,7) cls5 deeper 4FREE+find3",
+    )
+    # C: peel two extra 42-cores → find2 leaf (fusion candidate)
+    find2 = SearchPlan(
+        k=6,
+        m=7,
+        n=1,
+        roles=(FREE, FREE, FREE, FREE, FREE, PAIR, PAIR),
+        scale_S=42,
+        B_target=B_target,
+        free_scales=(14, 6, 21, 42, 42),
+        label="(6,1,7) cls5 deeper 5FREE+find2",
+    )
+    # D: same find2 but CRT-thinned estimate for w' only (optimistic grid)
+    #    — free_scales keep 14,6,21; last two 42; note CRT on w' is ~1/64 of B/21
+    find2_thin = SearchPlan(
+        k=6,
+        m=7,
+        n=1,
+        roles=(FREE, FREE, FREE, FREE, FREE, PAIR, PAIR),
+        scale_S=42,
+        B_target=B_target,
+        # w' thinned ~64: effective scale ≈ 21*64 = 1344
+        free_scales=(14, 6, 1344, 42, 42),
+        label="(6,1,7) cls5 5FREE+find2 (w' CRT~64)",
+    )
+    return [
+        ("617-prod", prod),
+        ("617-find3", find3),
+        ("617-find2", find2),
+        ("617-find2-crt", find2_thin),
+    ]
+
+
+def run_617_layer_c(B_target: float = 4.0e5) -> int:
+    print(f"=== Layer C: (6,1,7) cls5 peel depths @ B={B_target:.3e} ===")
+    print("Expect: production NOT cls5_shaped (find4); deeper find2 MAY be.\n")
+    for name, plan in known_617_cls5_plans(B_target):
+        sc = score_partition(plan)
+        print(sc.summary())
+        print(
+            f"  residual_arity={plan.residual_arity()}  "
+            f"leaf={'find'+str(plan.residual_arity()) if plan.residual_arity()>=2 else '?'}"
+        )
+        for n in sc.notes:
+            print(f"  note: {n}")
+        if name == "617-prod" and sc.cls5_shaped:
+            print("  FAIL: production find4 should not be cls5_shaped")
+            return 1
+        if name.startswith("617-find2") and not sc.P1:
+            print("  FAIL: find2 variant should have P1")
+            return 1
+    print()
+    print(
+        "CRT note: extra FREE on 42·c_i have NO residue thinning beyond 1..B/42.\n"
+        "u'/v' already Stage-1 anchors; w' has mod-64 classes in solve_617.\n"
+        "Deeper peel = same Meyrignac class, larger on-device grid — fusion only\n"
+        "helps if leaf is find2 and grid stays on GPU (no host materialize)."
+    )
+    return 0
+
+
 def run_demo(B_target: float = 3.0e6) -> int:
     print("=== controls (expect cls5+ => CLS5_SHAPED, others not) ===")
     ok = True
@@ -295,6 +386,12 @@ def run_demo(B_target: float = 3.0e6) -> int:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--demo", action="store_true", help="run controls + samples")
+    ap.add_argument(
+        "--617",
+        dest="do_617",
+        action="store_true",
+        help="Layer C: score (6,1,7) cls5 production + deeper peels",
+    )
     ap.add_argument("--k", type=int, default=None)
     ap.add_argument("--m", type=int, default=None)
     ap.add_argument("--n", type=int, default=None)
@@ -303,6 +400,9 @@ def main() -> int:
     ap.add_argument("--top", type=int, default=20)
     ap.add_argument("--all-shaped", action="store_true", help="only print cls5_shaped")
     args = ap.parse_args()
+
+    if args.do_617:
+        return run_617_layer_c(args.B if args.B != 3.0e6 else 4.0e5)
 
     if args.demo or (args.k is None):
         return run_demo(args.B)

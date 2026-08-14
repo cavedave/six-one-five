@@ -393,8 +393,8 @@ struct Params {
     u64 c_m504;                // 2^64 mod (504*42^6)   (cls5 T-mod reduction)
     u64 c_m247;                // 2^64 mod 247
     u64 inv42_247;             // (42^6)^{-1} mod 247
-    // --- cls5 triple-sum window gate (once-per-block; reuses t504/t247 residues) ---
-    u32 use_tri_gate;               // 0 disables it (--no-tri-gate)
+    // --- cls5 triple-sum window gate (find4: Q-c4^6 must be 3-sum achievable) ---
+    u32 use_tri_gate;               // 0 disables (--no-tri-gate)
     const u64* __restrict__ t504;   // triple-sum achievability bitmaps
     const u64* __restrict__ t247;
     u64* __restrict__ tri_skipped;  // blocks killed by the triple-sum gate
@@ -512,8 +512,19 @@ __global__ void k_find4(Params P) {
     gate_load(s_gate, P);
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const u32 base = C.c4lo + blockIdx.y * 2048 + warp;
-    u64 cnt = 0, ncall = 0, skip = 0;
+    u64 cnt = 0, ncall = 0, skip = 0, l_tri_skip = 0, l_tri_tot = 0;
     for (u32 c4 = base; c4 <= C.c4hi; c4 += 8) {
+        if (P.use_tri_gate) {
+            ++l_tri_tot;
+            u32 tr504 = C.q504 + 504u - s_gate.p6504[c4 % 504];
+            if (tr504 >= 504u) tr504 -= 504u;
+            u32 tr247 = C.q247 + 247u - s_gate.p6247[c4 % 247];
+            if (tr247 >= 247u) tr247 -= 247u;
+            if (!tri_get(P.t504, tr504) || !tri_get(P.t247, tr247)) {
+                ++l_tri_skip;
+                continue;
+            }
+        }
         u64 c4h, c4l; pow6_128(c4, c4h, c4l);
         const u64 rlo = C.q_lo - c4l;
         const u64 rhi = C.q_hi - c4h - (C.q_lo < c4l ? 1 : 0);
@@ -526,9 +537,8 @@ __global__ void k_find4(Params P) {
         const u64 tfp = C.q_lo - pow6_64(c4);
         u32 t4504 = 0, t4247 = 0, r504 = 0, r247 = 0;
         if (P.use_gate) {
-            const u32 c4r504 = c4 % 504, c4r247 = c4 % 247;
-            t4504 = C.q504 + 504u - s_gate.p6504[c4r504]; if (t4504 >= 504u) t4504 -= 504u;
-            t4247 = C.q247 + 247u - s_gate.p6247[c4r247]; if (t4247 >= 247u) t4247 -= 247u;
+            t4504 = C.q504 + 504u - s_gate.p6504[c4 % 504]; if (t4504 >= 504u) t4504 -= 504u;
+            t4247 = C.q247 + 247u - s_gate.p6247[c4 % 247]; if (t4247 >= 247u) t4247 -= 247u;
             r504 = (lo3 + lane) % 504; r247 = (lo3 + lane) % 247;
         }
         for (u32 c3 = lo3 + lane; c3 <= hi3; c3 += 32) {
@@ -545,6 +555,8 @@ __global__ void k_find4(Params P) {
     if (cnt) atomicAdd(P.probes, cnt);
     if (ncall) atomicAdd(P.calls, ncall);
     if (skip) atomicAdd(P.gated, skip);
+    if (l_tri_tot) atomicAdd(P.tri_total, l_tri_tot);
+    if (l_tri_skip) atomicAdd(P.tri_skipped, l_tri_skip);
 }
 
 // find4 (617 cls5): T = (base - (21w')^6)/42^6, window over c4 then c3.
@@ -559,7 +571,7 @@ __global__ void k_find4_cls5(Params P) {
     if (d == 0 || d > C.fmax1) return;
 
     __shared__ u64 s_rlo, s_rhi;
-    __shared__ u32 s_lo4, s_hi4;
+    __shared__ u32 s_lo4, s_hi4, s_q504, s_q247;
     __shared__ int s_active;
     __shared__ GateSh s_gate;
     if (!P.defer_gate_load) gate_load(s_gate, P);
@@ -576,6 +588,11 @@ __global__ void k_find4_cls5(Params P) {
                 if (lo4 <= hi4) {
                     s_rlo = rlo; s_rhi = rhi;
                     s_lo4 = lo4; s_hi4 = hi4;
+                    // T = R/42^6 residues (once per w'-grid cell; reused per c4)
+                    const u64 r1 = mod128_64(rhi, rlo, 504ULL * (u64)M42, P.c_m504);
+                    s_q504 = (u32)((r1 / (u64)M42) % 504ULL);
+                    const u64 r2 = mod128_64(rhi, rlo, 247ULL, P.c_m247);
+                    s_q247 = (u32)(r2 * P.inv42_247 % 247ULL);
                     s_active = 1;
                 }
             }
@@ -585,10 +602,22 @@ __global__ void k_find4_cls5(Params P) {
     if (!s_active) return;
     if (P.defer_gate_load) gate_load(s_gate, P);
     const u64 Rlo = s_rlo, Rhi = s_rhi;
+    const u32 Q504 = s_q504, Q247 = s_q247;
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const u32 base4 = s_lo4 + blockIdx.z * 2048 + warp;
-    u64 cnt = 0, ncall = 0, skip = 0;
+    u64 cnt = 0, ncall = 0, skip = 0, l_tri_skip = 0, l_tri_tot = 0;
     for (u32 c4 = base4; c4 <= s_hi4; c4 += 8) {
+        if (P.use_tri_gate) {
+            ++l_tri_tot;
+            u32 tr504 = Q504 + 504u - s_gate.p6504[c4 % 504];
+            if (tr504 >= 504u) tr504 -= 504u;
+            u32 tr247 = Q247 + 247u - s_gate.p6247[c4 % 247];
+            if (tr247 >= 247u) tr247 -= 247u;
+            if (!tri_get(P.t504, tr504) || !tri_get(P.t247, tr247)) {
+                ++l_tri_skip;
+                continue;
+            }
+        }
         u64 c4h, c4l; pow6_128(c4, c4h, c4l);
         if (mul128_small(c4h, c4l, (u64)M42)) continue;
         const u64 mlo = c4l, mhi = c4h;
@@ -605,10 +634,8 @@ __global__ void k_find4_cls5(Params P) {
         const u64 tfp = funnel_fp(rhi, rlo, P.inv216);
         u32 t4504 = 0, t4247 = 0, r504 = 0, r247 = 0;
         if (P.use_gate) {
-            const u64 r1 = mod128_64(rhi, rlo, 504ULL * (u64)M42, P.c_m504);
-            t4504 = (u32)((r1 / (u64)M42) % 504ULL);
-            const u64 r2 = mod128_64(rhi, rlo, 247ULL, P.c_m247);
-            t4247 = (u32)(r2 * P.inv42_247 % 247ULL);
+            t4504 = Q504 + 504u - s_gate.p6504[c4 % 504]; if (t4504 >= 504u) t4504 -= 504u;
+            t4247 = Q247 + 247u - s_gate.p6247[c4 % 247]; if (t4247 >= 247u) t4247 -= 247u;
             r504 = (lo3 + lane) % 504; r247 = (lo3 + lane) % 247;
         }
         for (u32 c3 = lo3 + lane; c3 <= hi3; c3 += 32) {
@@ -625,6 +652,8 @@ __global__ void k_find4_cls5(Params P) {
     if (cnt) atomicAdd(P.probes, cnt);
     if (ncall) atomicAdd(P.calls, ncall);
     if (skip) atomicAdd(P.gated, skip);
+    if (l_tri_tot) atomicAdd(P.tri_total, l_tri_tot);
+    if (l_tri_skip) atomicAdd(P.tri_skipped, l_tri_skip);
 }
 
 // =============================================================================
@@ -728,8 +757,8 @@ static void gpu_upload_tri(GpuCtx& g, const TriData& td) {
     g.tri_ready = true;
     // Combined keep-rate = product of per-modulus densities (CRT-independent).
     const double keep = (td.n504 / 504.0) * (td.n247 / 247.0);
-    fprintf(stderr, "[gpu] triple-sum window gate uploaded (cls5): "
-            "mod504=%d/504=%.1f%% mod247=%d/247=%.1f%% -> keeps ~%.2f%% of blocks\n",
+    fprintf(stderr, "[gpu] triple-sum gate uploaded (find4): "
+            "mod504=%d/504=%.1f%% mod247=%d/247=%.1f%% -> ~%.2f%% c4 pass (rest tri-skip)\n",
             td.n504, 100.0 * td.n504 / 504.0, td.n247, 100.0 * td.n247 / 247.0, 100.0 * keep);
 }
 
@@ -923,23 +952,35 @@ static RunResult gpu_run(GpuCtx& g, int cls, const std::vector<GpuCand>& v, u64 
     P.g504 = g.d_g504; P.g247 = g.d_g247; P.p6504 = g.d_p6504; P.p6247 = g.d_p6247;
     P.calls = g.d_calls; P.gated = g.d_gated;
     P.c_m504 = g.c_m504; P.c_m247 = g.c_m247; P.inv42_247 = g.inv42_247;
-    // triple-sum window gate (cls5 only)
-    P.use_tri_gate = 0u;   // 617 cls5 uses find4; tri-gate is for 3-sum targets only
+    // triple-sum gate on find4: (Q - c4^6) must be a 3-sum of sixth powers (lossless)
+    P.use_tri_gate = (g.tri_ready && g.tri_on && (cls == 5 || cls <= 4 || cls == 10)) ? 1u : 0u;
     P.t504 = g.d_t504; P.t247 = g.d_t247;
     P.tri_skipped = g.d_tri_skipped; P.tri_total = g.d_tri_total;
     P.defer_gate_load = (cls == 5 && g.defer_gate_load) ? 1u : 0u;
 
-    u32 ymax = 1;
-    if (cls <= 4 || cls == 10) ymax = 32;
-    else {
+    constexpr u32 kC4Tile = 2048;
+    u32 ymax = 1, zmax = 1;
+    if (cls <= 4 || cls == 10) {
+        for (const auto& C : v) {
+            const u32 span = (C.c4hi >= C.c4lo) ? (C.c4hi - C.c4lo + 1) : 0;
+            const u32 need = span ? (span + kC4Tile - 1) / kC4Tile : 1u;
+            if (need > ymax) ymax = need;
+        }
+        if (ymax > 32) ymax = 32;
+    } else {
         for (const auto& C : v) {
             const u32 f = C.nres1 * (C.fmax1 / C.mod1 + 1);
             if (f > ymax) ymax = f;
         }
+        u32 max_lim = 1;
+        for (const auto& C : v) if (C.lim > max_lim) max_lim = C.lim;
+        zmax = (max_lim + kC4Tile - 1) / kC4Tile;
+        if (zmax < 1) zmax = 1;
+        if (zmax > 32) zmax = 32;
     }
     const auto t0 = Clock::now();
     if (cls <= 4 || cls == 10) k_find4<<<dim3((u32)v.size(), ymax), 256>>>(P);
-    else if (cls == 5) k_find4_cls5<<<dim3((u32)v.size(), ymax, 32), 256>>>(P);
+    else if (cls == 5) k_find4_cls5<<<dim3((u32)v.size(), ymax, zmax), 256>>>(P);
     CU(cudaGetLastError());
     CU(cudaDeviceSynchronize());
     R.kernel_ms = std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - t0).count() / 1e3;
@@ -1712,6 +1753,7 @@ int main(int argc, char** argv) {
             "           --save-table F --load-table F --bench [K] --xcheck --quiet\n"
             "  --load-table F: packed xor (xor_build_save / fourcore v4 format; skip host peel).\n"
             "  --save-table F: write packed xor after build.\n"
+            "  --no-tri-gate: disable find4 3-sum gate (on by default; ~94%% c4 reject).\n"
             "           --check-known [--known-file F]  diff vs database after run\n"
             "           --branch-a-only / --branch-b-only\n"
             "           --branch-b-lim N  max term for Branch B pair index (default 12000)\n"
@@ -1992,7 +2034,7 @@ int main(int argc, char** argv) {
                     stat_probes[cls] / std::max(1e-9, stat_ms[cls] / 1e3), stat_exact[cls], stat_false[cls],
                     100.0 * (double)stat_gated[cls] / std::max(1.0, (double)(stat_gated[cls] + stat_calls[cls])));
             if (stat_tri_tot[cls])
-                fprintf(stderr, " tri-skip=%.2f%% (%llu/%llu blocks)",
+                fprintf(stderr, " tri-skip=%.2f%% (%llu/%llu c4)",
                         100.0 * (double)stat_tri_skip[cls] / (double)stat_tri_tot[cls],
                         (unsigned long long)stat_tri_skip[cls], (unsigned long long)stat_tri_tot[cls]);
             fprintf(stderr, "\n");

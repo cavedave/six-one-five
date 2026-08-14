@@ -76,8 +76,12 @@ solve_616_v1: solve_616_v1.cu mod60.hpp quad_sum.hpp k14_common.hpp
 
 v617: solve_617_v1
 
+# Override arch on rented GPUs, e.g.:
+#   make v617 NVCCFLAGS_617='-O3 -std=c++20 -gencode arch=compute_80,code=sm_80 -lineinfo'
+NVCCFLAGS_617 ?= $(NVCCFLAGS)
+
 solve_617_v1: solve_617_v1.cu mod60.hpp quad_sum.hpp k14_common.hpp $(FOURCORE_V4_DEPS)
-	$(NVCC) $(NVCCFLAGS) -I. -o $@ $<
+	$(NVCC) $(NVCCFLAGS_617) -I. -o $@ $<
 
 v2: solve_516_v2
 

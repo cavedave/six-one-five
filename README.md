@@ -2,7 +2,7 @@
 
 ## New (6,1,7) primitives found by this project
 
-Nine new primitive solutions of \(a_1^6+\cdots+a_7^6=B^6\) (2nd kind: \(7\nmid B\)),
+Eleven new primitive solutions of \(a_1^6+\cdots+a_7^6=B^6\) (2nd kind: \(7\nmid B\)),
 found with `solve_617_v1` Branch A. None appear in the prior EulerNet clean list
 (previous max there was \(B=410455\)).
 
@@ -17,6 +17,8 @@ found with `solve_617_v1` Branch A. None appear in the prior EulerNet clean list
 | **427027** | cls5 | \(62132^6 + 66276^6 + 188685^6 + 189378^6 + 201540^6 + 352884^6 + 397992^6\) |
 | **428195** | cls3 | \(128226^6 + 129213^6 + 169828^6 + 246792^6 + 290052^6 + 340158^6 + 394338^6\) |
 | **428329** | cls5 | \(51450^6 + 156681^6 + 161100^6 + 257964^6 + 275478^6 + 342384^6 + 395038^6\) |
+| **431597** | cls5 | \(78946^6 + 105504^6 + 137718^6 + 137907^6 + 150780^6 + 156648^6 + 431130^6\) |
+| **433717** | cls5 | \(73206^6 + 96117^6 + 118622^6 + 126924^6 + 158676^6 + 316068^6 + 421848^6\) |
 
 Each row satisfies \(\sum a_i^6 = B^6\) with \(\gcd(a_1,\ldots,a_7,B)=1\).
 
@@ -227,8 +229,8 @@ with `solve_617_v1.cu` (sibling of the 616 solver):
 | Item | Value |
 |---|---|
 | Known list (EulerNet clean, prior) | 178 solutions, \(B \le 410455\) |
-| **New primitives (this project)** | **7** — see table at top (all 2nd kind) |
-| Branch A strip cleared | through \(B \approx 430000\) (from ~400k) |
+| **New primitives (this project)** | **11** — see table at top |
+| Branch A strip cleared | through \(B \approx 435248\) (430001–435248 cls5 xor run; resume 435249) |
 | Solver | `make v617` → `./solve_617_v1` |
 
 Typical overnight Branch A launch (use `--chunk 64` near 400k+ to bound host RAM):
